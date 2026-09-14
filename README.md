@@ -504,7 +504,30 @@ node tools/lib/dsh-runtime.mjs   # 直接运行可打印 DSH 运行时依赖的�
 > `yaml` 若独立安装就可能与 DSH 实际使用的版本漂移，而"我这边能解析、DSH 那边起不来"正是最糟的失败模式）。
 > 探测不到时可用 `DSH_RUNTIME_ROOT=<含 node_modules/@deepseek-ai/dsh 的目录>` 显式指定。
 
-已修复的 **39 项缺陷**（含 3 项只有真机验证才能发现、1 项在写代码时被自己拦住）证据与修法见 `ISSUES.md`。
+### 8.1 发布流程（GitHub + Gitee 同步）
+
+发布脚本在 `tools/release/`，令牌从 DSH 凭据库按需读取（`GITHUB_TOKEN` / `GITEE_TOKEN`）：
+
+```powershell
+node tools/release/verify-tokens.mjs        # 自检：令牌是否可用（只打印账号名，绝不打印令牌）
+node tools/release/publish.mjs              # 预演：查远端状态，不改动
+node tools/release/publish.mjs --apply      # 真正发布：建仓（若无）→ 推 main + tags → 发 release
+node tools/release/publish.mjs --apply --move-tag   # 把 tag 强制挪到当前提交（仅用于发布物有缺陷时）
+node tools/release/verify-published.mjs v0.2.0      # 从两个平台的 API 核对仓库/tag/release/提交
+```
+
+四条刻意的设计（都是踩过之后加的）：
+
+| 设计 | 原因 |
+|---|---|
+| **令牌绝不落盘、不进命令行参数** | 推送时写一个**临时**凭据文件交给 git（`credential.helper=store --file=…`），推完立即删除；远端地址始终不含令牌，`.git/config` 里也不会留下 |
+| **临时凭据路径必须用正斜杠** | git 的配置值里**反斜杠是转义符**：用 `C:\Users\…` 会被吃掉反斜杠变成相对路径，于是 git 把**明文令牌写进了仓库工作区**（实测发生，3 个文件，未被提交，已删除）。现在路径用 `/`，并断言落点 + 推送后扫描工作区，发现即删除并报错 |
+| **双平台幂等** | 重跑发布不能失败：GitHub 的"已存在"是 422、Gitee 是 400，两边都识别为"跳过" |
+| **API 调用带重试** | 首次发布就遇到 `HTTP/2 GOAWAY` 抖动；不重试会留下"仓库建好、代码推上去、release 没发出来"的半成品状态 |
+
+> ⚠️ 发布脚本会创建**公开**仓库。若想改成私有，在平台上改一次即可（脚本只在创建时决定可见性）。
+
+已修复的 **43 项缺陷**（含 3 项只有真机验证才能发现、1 项在写代码时被自己拦住、1 项被"绿测试"掩盖）证据与修法见 `ISSUES.md`。
 
 ---
 

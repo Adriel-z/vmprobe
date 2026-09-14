@@ -1,0 +1,25 @@
+# ============================================================================
+#  差分实验用的叠加层：故意指向**不存在的路径**
+#
+#  目的：判定 Loader 到底有没有在启动期解析并 import 插件入口。
+#    · 若本次启动**报错**（模块无法解析）→ 说明 Loader 确实做了解析/导入，
+#      那么用真实路径启动成功、就等价于"我的模块被 import 了"。
+#    · 若本次启动**照样成功** → 说明 `--help` 在加载插件树之前就短路了，
+#      "成功"不能作为加载证据，必须改用真正 serve 的方式再验。
+#
+#  这个实验**真的抓到过假信号**：当时 `--help` 启动"成功"了，用本文件对照才发现
+#  同类启动也成功 —— 也就是说那次成功根本没加载插件。见 ISSUES.md §9。
+#
+#  怎么用：
+#    dsh --profile web --patch tools/overlay-bogus.yml --help        # 预期：也 exit 0（说明 --help 提前短路）
+#    dsh --profile web --patch tools/overlay-bogus.yml --no-open --port 0   # 预期：exit 1 + failed to import
+#
+#  它**故意是坏的**，因此 tools/doctor.mjs 会跳过它，不算预检失败。
+# ============================================================================
+
+- insert:
+  - id: vmprobe-host-bogus
+    name: 'C:\Users\-\work\vmprobe\packages\THIS-PATH-DOES-NOT-EXIST'
+    config:
+      storageDir: 'C:\Users\-\work\vmprobe\.vmprobe-dev-bogus'
+      dailyReport: false

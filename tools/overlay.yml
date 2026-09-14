@@ -1,0 +1,42 @@
+# ============================================================================
+#  VMProbe —— 用 `--patch` 叠加层加载插件的**开发/验证**配置
+#
+#  ⚠️⚠️ 与"已安装的 bundle"**互斥**，不要同时用！⚠️⚠️
+#
+#      插件正式安装后（profile 里 `dsh plugin add` 过），它自带的 cordis.patch.yml
+#      会插入一条 `id: vmprobe-host`。若本文件再插入同 id 条目，DSH 启动会直接失败：
+#          Error: plugin tree failed to load: duplicate loader entry id: vmprobe-host
+#      这是**整棵插件树加载失败 → 进程 exit 1** 的致命形态，和凭据文件写错一样的后果。
+#
+#      · 已安装（推荐路径）→ **不要用本文件**。因为依赖用的是 `link:`，
+#        改了源码重启一下就生效，开发循环是"改源码 + 起临时实例"，不需要任何 --patch。
+#      · 未安装（干净环境里验证挂载）→ 用本文件。
+#      · 不确定？先跑 `node tools/doctor.mjs`，它会明确告诉你两者是否冲突。
+#
+#  用法（把配置树打印出来看一眼，不启动服务）：
+#      dsh --profile web --patch tools/overlay.yml --dump-config
+#
+#  真正的加载验证必须**启动一次**（`--dump-config` 只合成配置树、不做 import，
+#  所以哪怕路径是错的它也照样"成功"）。用临时端口起实例，不影响在跑的实例：
+#      dsh --profile web --patch tools/overlay.yml --no-open --port 0
+#
+#  为什么开发时优先用 `--patch` 而不是改 profile 本体：
+#      正在为你服务的实例用的是 profiles/web/cordis.patch.yml。改那个文件会影响它，
+#      而**任何一条 entry 加载失败都会让整棵树失败**（实测过：一次 .credentials.yaml
+#      的 YAML 语法错误就足以让 DSH 再也起不来）。`--patch` 只影响这一次启动。
+# ============================================================================
+
+- insert:
+  - id: vmprobe-host
+    # Windows 上**必须**用 file:// URL，且必须指向**入口文件**：
+    #   · 裸绝对路径 → ESM loader 拒绝："Received protocol 'c:'"
+    #   · file:// 指向目录 → "Directory import ... not supported (ERR_UNSUPPORTED_DIR_IMPORT)"
+    # 还有一种可用形式是包名（正式安装走那条）。
+    name: 'file:///C:/Users/-/work/vmprobe/packages/plugin-host/src/index.js'
+    config:
+      # 用独立目录，避免污染真实数据（真实默认是 $DSH_HOME/vmprobe）
+      storageDir: 'C:\Users\-\work\vmprobe\.vmprobe-dev'
+      catalogDir: 'C:\Users\-\work\vmprobe\packages\catalog\actions'
+      # 验证期间关掉定时器：要验的是"插件能否被加载"，不是定时器行为，
+      # 少一个活动部件就少一分对现场的影响。
+      dailyReport: false

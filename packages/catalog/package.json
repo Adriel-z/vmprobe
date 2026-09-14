@@ -1,0 +1,11 @@
+{
+  "name": "@vmprobe/catalog",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "VMProbe 动作目录：声明式动作定义 + 严格校验加载器。",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  }
+}

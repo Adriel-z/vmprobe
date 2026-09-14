@@ -1,0 +1,20 @@
+{
+  "name": "@vmprobe/plugin-host",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "VMProbe 的 DSH Host 插件：注册 vmprobe_* 工具、接线审批、维护审计。",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml"
+  ]
+}

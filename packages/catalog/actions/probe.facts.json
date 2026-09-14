@@ -1,0 +1,32 @@
+{
+  "id": "probe.facts",
+  "version": 2,
+  "side": "controller",
+  "title": { "zh": "采集环境画像", "en": "Collect machine facts" },
+  "summary": "只读探测发行版/内核/架构/init/包管理器/硬件/负载/网络/SSH 配置",
+  "risk": "R0",
+  "params": {
+    "type": "object",
+    "properties": {
+      "section": {
+        "type": "string",
+        "enum": ["all", "os", "pkg", "hw", "net", "ssh", "caps"],
+        "default": "all",
+        "description": "分节查询（尚未接线：传非默认值会被 fail-closed 阻断，而不是静默返回全量）"
+      }
+    },
+    "additionalProperties": false
+  },
+  "requires": { "root": false, "distros": [], "binaries": [] },
+  "idempotent": true,
+  "timeoutMs": 60000,
+  "check": { "probe": "none" },
+  "apply": {
+    "default": { "handler": "probe.facts" }
+  },
+  "notes": [
+    "纯只读，R0：免审批但写入审计",
+    "controller 侧动作：协从端脚本由主控端经 SSH stdin 投递执行（sh -s -- --check），因此不要求远端预先安装任何东西 —— 只要有一个 POSIX sh。这是零安装首次接触的关键。",
+    "采集结果落盘到 <storageDir>/facts/<targetId>.json，作为动作按发行版分流的依据"
+  ]
+}

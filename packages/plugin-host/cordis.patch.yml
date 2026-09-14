@@ -1,0 +1,30 @@
+# ============================================================================
+#  VMProbe 作为 DSH profile 层的 patch
+#
+#  这是 `package.json` 里 `dsh.bundle.patch` 指向的文件（已核实 dsh-base /
+#  dsh-web-app 都是这个形态）。有了它，本包就不再只是"普通依赖"，而是**一层
+#  profile 补丁** —— 在 profile 里 `dsh plugin add` 之后**自动激活**，
+#  不需要手改用户自己的 cordis.patch.yml。
+#
+#  没声明 dsh.bundle 时 DSH 会明确提示：
+#    "declares no dsh.bundle — installed as a plain dependency, not a profile layer"
+#
+#  挂载形式的两个硬约束（都是实测出来的，不是猜的）：
+#    1. Windows 上 `name` **不能是裸绝对路径** —— ESM loader 只接受 file:// URL：
+#         "Only URLs with a scheme in: file, data, and node are supported...
+#          Received protocol 'c:'"
+#    2. `name` 指向**目录**也不行 —— Node 不支持目录导入：
+#         "Directory import ... is not supported resolving ES modules
+#          (ERR_UNSUPPORTED_DIR_IMPORT)"
+#    所以这里用**包名**（由 profile 的 node_modules 解析）—— 这是最稳的形式。
+# ============================================================================
+
+- insert:
+  - id: vmprobe-host
+    name: '@vmprobe/plugin-host'
+    # 留空即全部使用插件默认值：
+    #   storageDir = $DSH_HOME/vmprobe，planTtlMs = 5min，dailyReport = true（UTC 08:00）
+    # 需要覆盖时在此写 config，例如：
+    #   config:
+    #     reportAtUtc: '01:00'     # 每天 UTC 01:00 生成日报（= 本地 09:00）
+    #     planTtlMs: 120000        # 计划有效期 2 分钟

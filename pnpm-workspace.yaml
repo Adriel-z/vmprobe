@@ -1,0 +1,9 @@
+# VMProbe 是一个小型 workspace：core（纯逻辑）/ catalog（动作目录）/ plugin-host（DSH 插件）。
+#
+# 注意：`packages/*` 已经覆盖全部包，不要再单独列条目 ——
+# 早期版本在这里列了尚未存在的 `packages/plugin-client`，pnpm 会因此告警甚至报错。
+packages:
+  - packages/*
+
+nodeLinker: hoisted
+autoInstallPeers: false

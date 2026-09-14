@@ -1,0 +1,93 @@
+{
+  "id": "system.update",
+  "version": 2,
+  "side": "agent",
+  "title": { "zh": "更新系统软件包", "en": "Update system packages" },
+  "summary": "刷新仓库元数据并升级全部可升级软件包；支持仅安全更新、排除包、预演",
+  "risk": "dynamic",
+  "params": {
+    "type": "object",
+    "properties": {
+      "securityOnly": {
+        "type": "boolean",
+        "default": false,
+        "description": "仅安装安全更新（RHEL 系用 --security，SUSE 用 --category security；Debian/Arch/Alpine 无对应机制，传此参数会被拒绝）"
+      },
+      "exclude": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "锁定包名（glob，如 linux-*）；RHEL/SUSE/Arch 支持，Debian/Alpine 不支持"
+      },
+      "dryRun": {
+        "type": "boolean",
+        "default": false,
+        "description": "只预演不执行（各发行版用自己的模拟开关；预演时不会刷新仓库元数据）"
+      }
+    },
+    "additionalProperties": false
+  },
+  "requires": { "root": true, "distros": ["debian", "rhel", "suse", "arch", "alpine"], "binaries": [] },
+  "idempotent": true,
+  "timeoutMs": 3600000,
+  "check": { "probe": "pkg.upgradable" },
+  "apply": {
+    "debian": {
+      "pre": [["apt-get", "update"]],
+      "cmd": [
+        [
+          "apt-get", "-y",
+          "-o", "Dpkg::Options::=--force-confold",
+          "dist-upgrade"
+        ]
+      ],
+      "dryRun": [["apt-get", "-s", "-y", "dist-upgrade"]],
+      "env": { "DEBIAN_FRONTEND": "noninteractive" }
+    },
+    "rhel": {
+      "cmd": [
+        [
+          "dnf", "-y", "--refresh",
+          { "$when": "securityOnly", "argv": ["--security"] },
+          { "$param": "exclude", "prefix": "--exclude=" },
+          "upgrade"
+        ]
+      ],
+      "dryRun": [["dnf", "-y", "--assumeno", "upgrade"]],
+      "env": { "DNF_NONINTERACTIVE": "1" }
+    },
+    "suse": {
+      "cmd": [
+        [
+          "zypper", "--non-interactive",
+          { "$when": "securityOnly", "argv": ["--category", "security"] },
+          { "$param": "exclude", "prefix": "--exclude=" },
+          "update"
+        ]
+      ],
+      "dryRun": [["zypper", "--non-interactive", "--dry-run", "update"]]
+    },
+    "arch": {
+      "cmd": [
+        [
+          "pacman", "-Syu", "--noconfirm",
+          { "$param": "exclude", "prefix": "--ignore=" }
+        ]
+      ],
+      "dryRun": [["pacman", "-Syu", "--print"]]
+    },
+    "alpine": {
+      "pre": [["apk", "update"]],
+      "cmd": [["apk", "upgrade"]],
+      "dryRun": [["apk", "upgrade", "--simulate"]]
+    }
+  },
+  "verify": { "probe": "pkg.upgradable", "expect": { "count": 0 }, "maxWaitMs": 5000 },
+  "rollback": { "strategy": "snapshot-if-available", "snapshotBefore": true },
+  "notes": [
+    "升级含内核时需重启才能生效，本动作不自动重启",
+    "建议执行前确认磁盘可回收空间 > 2GiB（check 会给出估算）",
+    "参数支持按发行版区分：未在该分支 argv 里引用的参数会被 fail-closed 阻断（例如 Debian 不支持 securityOnly/exclude），这是刻意的，避免'以为只做了安全更新、实际全量升级'",
+    "预演（dryRun=true）会跳过 pre，因此不会刷新仓库元数据"
+  ]
+}

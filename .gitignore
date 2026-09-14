@@ -6,6 +6,8 @@ node_modules/
 *.out
 *.err
 *.tmp-*
+*.tmp
+.git-*.tmp
 .vmprobe-state/
 .m0-state/
 # 测试台的"远端根"（正常会被 stop() 删掉；异常中断时的残骸绝不入库 ——

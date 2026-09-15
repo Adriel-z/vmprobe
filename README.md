@@ -36,14 +36,16 @@
 | **取消贯通** | ✅ 已实现：中断一路传到 SSH 通道（先 TERM、再硬关），远端命令不会继续跑完；连接仍可用 |
 | **动作参数接线（按发行版）** | ✅ 已实现：`securityOnly`/`exclude`/`dryRun` 真正进入 argv，不支持的分支 fail-closed |
 | **掩码凭据录入（密码不进对话）** | ✅ `tools/vmprobe-cred.mjs`（交互式不回显）+ 接入 DSH 凭据库 |
+| **归档与迁移（`.vmpz`）** | ✅ 已实现：**标准 zip**（能被资源管理器 / `unzip` 直接打开）+ 清单 sha256 + 导入差异预览 + 私钥强制加密；**审计密钥与私钥永不入档**（见 §5.7） |
+| **审计链 HMAC 加固** | ✅ 已实现：默认自动生成密钥 → 篡改可检出**且伪造需要密钥**；旧的无密钥链照旧可验（见 §5.5） |
 | 风险分级 / 审批决策 / 计划指纹（TOCTOU） | ✅ 已实现，**审批阈值真的可配**（见 §5.6） |
-| 审计链（落盘 + 轮转 + 跨文件校验） | ✅ 已实现 |
 | 统一脱敏 / 拒密 | ✅ 已实现 |
 | 每日报告按天存文件 + 定时触发 + 自动清理 | ✅ 已实现并真机验证已排程 |
+| 运行日志（`logs/run.jsonl`） | ✅ 已实现：与审计分工 —— 带 `level`、给人看、不入哈希链 |
 | 插件装入 DSH 并自动激活 | ✅ 已真机验证（6 个工具、4 个动作） |
+| 审批服务缺失时的行为 | ✅ **插件照常加载**，R0/R1 可用，R2/R3 一律拒绝（fail-closed）；日志 / 台账 / 状态三处可见（I5 决策） |
 | 客户端 UI（浏览器侧状态徽标 / 设置页） | ⛔ **受环境阻塞**（本机发行版无客户端打包器、客户端 peer 包未发布；证据见 `ISSUES.md` §12.4）。替代：结果卡片带校验结论、状态工具带配置警告、凭据走 CLI 掩码录入 |
-| 归档导入导出 | ⛔ 未实现（M3） |
-| 协同端守护进程 / 本地定时 | ⛔ 未实现（M4） |
+| 协从端守护进程 / 本地定时（M4） | ⛔ **刻意推迟**：其价值全在 Linux 特有行为（unix socket / systemd / logrotate），本机无 Linux 目标 → 只能半验证，宁可不做（`ISSUES.md` §13.5） |
 
 **真实可用的动作**：
 
@@ -57,8 +59,9 @@
 已经跑通的验证（全部可复现，见 §8）：
 
 ```
-143 项单元测试 · 插件契约（含用 DSH 自己的 schema 校验器验证） · 21 个故障推演探测点
+174 项单元测试 · 插件契约（含用 DSH 自己的 schema 校验器验证） · 21 个故障推演探测点
 27 项 SSH 端到端（真实协议 + 真实 authorized_keys 闭环 + 心跳三态 + verify 四情形 + 取消贯通）
+12 项归档检查（含**把归档交给 PowerShell Expand-Archive 解压**的外部交叉验证）
 8 项安装守卫 · 文档路径一致性 · 环境预检 · 真机加载
 ```
 
@@ -391,7 +394,6 @@ node -e "import('./packages/plugin-host/src/engine.js').then(async m => { const 
 ### 5.6 配置项
 
 在 profile 的 `cordis.patch.yml`（或用 `--patch` 叠加层）里写：
-
 ```yaml
 - insert:
   - id: vmprobe-host
@@ -410,6 +412,10 @@ node -e "import('./packages/plugin-host/src/engine.js').then(async m => { const 
       maxAuditBytes: 8388608          # 审计文件轮转阈值，默认 8 MiB
       maxRunBytes: 4194304            # 单次运行记录落盘上限，默认 4 MiB
       maxAuditRecords: 5000           # 审计内存窗口上限
+      auditHmac: true                 # 审计链是否加 HMAC（默认开；false = 退回纯 sha256）
+      auditKeyFile: 'D:\secrets\vmprobe-audit.key'   # 审计密钥文件（默认 <storageDir>/audit-hmac.key，不存在则生成）
+      runLog: true                    # 运行日志 logs/run.jsonl（默认开）
+      maxRunLogBytes: 8388608         # 运行日志轮转阈值，默认 8 MiB
       autoAllowUpTo: 'R1'             # 该级及以下免弹窗（仍写审计）；R0 = 更严格
       alwaysAskFrom: 'R2'             # 该级及以上必须审批（下限，放宽也绕不过）
       echoHostnameAt: 'R3'            # 该级及以上要求复述主机名
@@ -424,8 +430,48 @@ node -e "import('./packages/plugin-host/src/engine.js').then(async m => { const 
   默认 `R1` 下行为与之前完全一致。
 - `allowRawShell` **不是开关**：T3 原始 shell 尚未实现，写 `true` 会被明确拒绝并告警，
   而不是让你以为它开着。当前所有执行都必须经过动作目录与审批。
+- **审计密钥的边界**：密钥默认生成在 `<storageDir>/audit-hmac.key`（0600）。
+  它**永远不会进入归档**（否则拿到归档的人就能伪造审计链）。
+  但要认清一条：**密钥与审计文件放在同一个目录时，它挡不住"能读该目录的人"** ——
+  想更强就把 `auditKeyFile` 指到别处（例如系统密钥目录），
+  或经 `auditKey` 从凭据库注入（该路径尚未接线，见 `DEVELOPMENT.md` 技术债）。
+  另外：**整段重写审计历史**无法由链自身识别（重写会抹掉 hmac 痕迹）——
+  链能自证"没被局部改过"，不能自证"没被整段换过"；这条边界写在 `DESIGN.md` D15。
 - **键名写错会被明确指出**：未知配置键、非法风险级、比默认更宽松的策略，都会出现在
   ① 日志、② 加载台账（`config.warning`）、③ `vmprobe_status` 的输出里。不会再出现"改了没效果但没人告诉你"。
+- **没有审批服务时**（profile 里没装审批插件）：插件**照常加载**，R0/R1 照常执行，
+  **R2/R3 一律拒绝**，并在上述三处显示"审批服务不可用"。这是刻意的：一个可选服务的缺失
+  不该导致整棵插件树加载失败，而安全属性由**执行时**的 fail-closed 保证。
+
+### 5.7 归档与迁移（`.vmpz`）
+
+```powershell
+# 导出（默认：目标定义 + 画像 + 日报 + 加载台账；默认脱敏档位 standard）
+node tools/vmprobe-archive.mjs export vm-backup.vmpz
+node tools/vmprobe-archive.mjs export vm-backup.vmpz --include-audit --include-runs --redact none
+# 带私钥：必须给口令（交互式不回显；或 --passphrase-env VAR，不接受命令行明文口令）
+node tools/vmprobe-archive.mjs export full.vmpz --include-secrets
+
+# 看里面有什么（不落盘）
+node tools/vmprobe-archive.mjs inspect vm-backup.vmpz
+
+# 导入：**默认只预演**，列出 新增/一致/冲突/凭据缺口
+node tools/vmprobe-archive.mjs import vm-backup.vmpz
+node tools/vmprobe-archive.mjs import vm-backup.vmpz --apply              # 真正写入
+node tools/vmprobe-archive.mjs import vm-backup.vmpz --apply --overwrite  # 覆盖冲突（先备份为 *.vmpz-bak）
+```
+
+四条刻意的设计：
+
+| 设计 | 原因 |
+|---|---|
+| **标准 zip 容器**（自研约 200 行，零依赖） | 归档要能被**别的工具**打开（资源管理器、`unzip`、另一台机器）。测试里用 **PowerShell `Expand-Archive`** 做外部交叉验证 —— 否则"只有我自己能读"的格式也会测试通过 |
+| **审计密钥与私钥永不入档** | 密钥是"抗伪造的根"，它随归档流出去 = HMAC 白做。这是**硬编码排除**，且在清单里如实记下"跳过了什么、为什么" |
+| **清单逐文件 sha256** | 导入前一一核对；不符即拒绝。"尽力而为地导入半个"比拒绝更危险 |
+| **默认预演 + 默认不覆盖** | 导入会动本地数据。覆盖必须显式 `--overwrite`，且**先备份** |
+
+> 迁移后的典型动作：`import` 的预演输出会列出**凭据缺口**（例如 `t_vm → VMPROBE_VM_A_PASSWORD`），
+> 用 `node tools/vmprobe-cred.mjs set <引用名>` 重新录入即可 —— 归档从不搬运密码。
 
 ---
 
@@ -485,10 +531,11 @@ Get-Content "$env:USERPROFILE\.dsh\vmprobe\loads.jsonl" -Tail 3
 npm run check
 
 # 单项
-npm run test            # 单元测试（143 项：core 113 + transport 9 + plugin-host 21）
+npm run test            # 单元测试（174 项：core 132 + transport 9 + plugin-host 33）
 npm run check:plugin    # 插件契约与行为（会用 DSH 自己的 schema 校验器验子集）
 npm run check:faults    # 故障推演 / 回归（21 个探测点）
 npm run check:ssh       # SSH 端到端（真实 ssh2 服务端，27 项）
+npm run check:archive   # 归档（含 PowerShell 外部解压交叉验证，12 项）
 npm run check:docs      # 文档里提到的项目内路径是否真实存在
 npm run check:doctor    # 环境预检
 npm run check:agent     # 协从端脚本（自动定位 bash，Windows 上无需改 PATH）
@@ -527,7 +574,7 @@ node tools/release/verify-published.mjs v0.2.0      # 从两个平台的 API 核
 
 > ⚠️ 发布脚本会创建**公开**仓库。若想改成私有，在平台上改一次即可（脚本只在创建时决定可见性）。
 
-已修复的 **43 项缺陷**（含 3 项只有真机验证才能发现、1 项在写代码时被自己拦住、1 项被"绿测试"掩盖）证据与修法见 `ISSUES.md`。
+已修复的 **45 项缺陷**（含 3 项只有真机验证才能发现、1 项在写代码时被自己拦住、1 项被"绿测试"掩盖）证据与修法见 `ISSUES.md`。
 
 ---
 

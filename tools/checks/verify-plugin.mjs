@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,9 +57,16 @@ console.log('\n[1] 模块契约（DSH 函数插件约定）');
 check('有 name 导出', () => assert.equal(typeof mod.name, 'string'));
 check('有 apply 导出', () => assert.equal(typeof mod.apply, 'function'));
 check('有 inject 导出且为数组', () => assert.ok(Array.isArray(mod.inject)));
-check('inject 含 tools 与 approval（安全边界不可选）', () => {
+check('inject 含 tools（核心必需）', () => {
   assert.ok(mod.inject.includes('tools'), 'inject 必须含 tools');
-  assert.ok(mod.inject.includes('approval'), 'inject 必须含 approval');
+});
+check('★ inject **不含** approval（I5 决策：加载不阻塞，执行时 fail-closed）', () => {
+  assert.ok(
+    !mod.inject.includes('approval'),
+    'approval 若留在 inject 里，缺审批服务的 profile 中 apply() 根本不会执行 —— '
+    + '一个可选服务的缺失不该导致插件（乃至整棵插件树）加载失败。'
+    + '安全性由执行时的 fail-closed 保证，见 [7]。',
+  );
 });
 check('**没有 default 导出**（否则 Loader 会丢掉 inject）', () => {
   assert.equal(mod.default, undefined, 'default 导出会让 unwrapExports 折叠模块');
@@ -275,6 +283,124 @@ try {
   for (const [level, msg] of logs) console.log(`  [${level}] ${msg}`);
 } finally {
   await rm(stateDir, { recursive: true, force: true });
+}
+
+// ===========================================================================
+// [7] I5：**没有审批服务时**的行为 —— 插件必须照样加载，且 R2/R3 一律拒绝
+//
+// 这一节守的是一个安全属性 + 一个可用性属性，两者都不能丢：
+//   · 可用性：缺 approval 不能导致插件加载失败（否则一个可选服务就能让整棵树起不来）
+//   · 安全：  缺 approval 时**绝不能**执行 R2/R3（fail-closed）
+// 上一版把 approval 放在 inject 里靠"不加载"来保证安全 —— 代价太大，这里改成运行时守。
+// ===========================================================================
+console.log('\n[7] I5：缺少审批服务时的加载与执行行为');
+
+{
+  const noApprovalDir = await mkdtemp(join(tmpdir(), 'vmprobe-noapproval-'));
+  const registeredNoApproval = [];
+  const logsNoApproval = [];
+  /**
+   * 假传输层：**只做一件事** —— 让"计划新鲜度"这一关能过，
+   * 这样 R3 才会走到**审批那一关**，测到的才是审批护栏而不是别的护栏。
+   * （第一版这里用 `transport: null`，结果 R3 停在 `stale`，根本没碰到审批 ——
+   *   断言"被拒绝"会通过，但拒绝的原因完全不是我以为的那个。）
+   * 同时记录 apply 次数：缺审批时它必须是 **0**（一行都没执行）。
+   */
+  const i5Transport = {
+    applyCalls: 0,
+    async state() { return 'connected'; },
+    async check() {
+      return { probed: true, pubkeyAuth: true, passwordAuth: true, port: 22, serviceKeyInstalled: false };
+    },
+    async apply() { i5Transport.applyCalls += 1; return { exit: 0 }; },
+    async heartbeat() { return { ok: true, at: new Date().toISOString(), latencyMs: 1 }; },
+  };
+  const noApprovalCtx = {
+    tools: { register(def) { registeredNoApproval.push(def); return () => {}; } },
+    // 刻意**不提供** approval
+    logger: { info: (m) => logsNoApproval.push(['info', m]), warn: (m) => logsNoApproval.push(['warn', m]) },
+    inject: () => {},
+  };
+
+  try {
+    let loadError = null;
+    try {
+      mod.apply(noApprovalCtx, {
+        storageDir: noApprovalDir,
+        transport: i5Transport,          // 有传输层 → 新鲜度可通过 → 才会走到审批护栏
+        dailyReport: false,
+        loadMarkerFile: join(noApprovalDir, 'loads.jsonl'),
+      });
+    } catch (err) {
+      loadError = err;
+    }
+
+    check('★ 没有 approval 时插件仍能加载（apply 不抛错）', () => {
+      assert.equal(loadError, null, `apply 抛错了：${loadError?.message}`);
+    });
+    check('★ 没有 approval 时工具照样全部注册', () => {
+      assert.equal(registeredNoApproval.length, 6, `应注册 6 个工具，实际 ${registeredNoApproval.length}`);
+    });
+    check('没有 approval 时明确告警（不静默）', () => {
+      const warned = logsNoApproval.some(([lvl, m]) => lvl === 'warn' && /审批服务/.test(m));
+      assert.ok(warned, `应有审批服务不可用的告警，实际日志：${JSON.stringify(logsNoApproval)}`);
+    });
+    check('加载台账记下 approval.unavailable', () => {
+      const ledger = readFileSync(join(noApprovalDir, 'loads.jsonl'), 'utf8');
+      assert.ok(ledger.includes('"approval.unavailable"'), '台账里应有 approval.unavailable 事件');
+      assert.ok(ledger.includes('"load"'), '仍然要有 load 事件');
+    });
+
+    // ── 执行侧：R0 可用、R2/R3 必须被拒 ──────────────────────────────────
+    const statusTool = registeredNoApproval.find((d) => d.name === 'vmprobe_status');
+    const actionTool = registeredNoApproval.find((d) => d.name === 'vmprobe_action');
+    const targetsTool = registeredNoApproval.find((d) => d.name === 'vmprobe_targets');
+    const execCtx = { callId: 'c1', signal: new AbortController().signal, arguments: {} };
+
+    // 先加一个目标（否则动作会因为"目标不存在"而失败，测不到审批这一层）
+    await targetsTool.execute(
+      { op: 'add', id: 't_i5', hostname: '10.0.0.9', user: 'ops', authRef: 'VMPROBE_I5_PASSWORD' },
+      execCtx,
+    );
+
+    const status = await statusTool.execute({}, execCtx);
+    check('状态工具如实报告"审批不可用"', () => {
+      assert.equal(status.approvalAvailable, false);
+      assert.ok(
+        status.warnings.some((w) => /审批服务/.test(w)),
+        '状态里的警告应包含审批不可用',
+      );
+    });
+
+    // R0 动作（probe.facts，controller 侧；这里没有传输层，预期走到"未实现"而不是"被审批拒绝"）
+    const r0 = await actionTool.execute({ target: 't_i5', action: 'probe.facts' }, execCtx).catch((e) => ({ threw: e }));
+    check('R0/R1 动作**不会**因为缺审批被拒（缺的是传输层，不是审批）', () => {
+      const asText = JSON.stringify(r0);
+      assert.ok(
+        !/审批服务不可用/.test(asText),
+        `R0 动作不应被审批拦下，实际：${asText.slice(0, 200)}`,
+      );
+    });
+
+    // R3 动作（免密登录）：必须被 fail-closed 拒绝
+    const r3 = await actionTool.execute({ target: 't_i5', action: 'ssh.passwordless.enable' }, execCtx);
+    check('★ R3 动作在缺审批时被 fail-closed 拒绝执行', () => {
+      assert.equal(r3?.status, 'blocked', `R3 应被阻断，实际 status=${r3?.status}（若为 stale 说明没走到审批这一关）`);
+      assert.match(String(r3?.error ?? ''), /审批服务不可用/, '拒绝原因必须点明是审批服务不可用');
+    });
+    check('★ 被拒时**一行都没执行**（transport.apply 调用次数为 0）', () => {
+      assert.equal(i5Transport.applyCalls, 0, `apply 被调用了 ${i5Transport.applyCalls} 次 —— 护栏漏了`);
+    });
+    check('被拒时不谎报成功（没有 result/verify）', () => {
+      assert.equal(r3.verify ?? null, null, '被拒绝的执行不应产生校验结论');
+      assert.equal(r3.run ?? null, null, '被拒绝的执行不应产生运行记录');
+    });
+
+    console.log('\n[8] 无审批服务时的日志');
+    for (const [level, msg] of logsNoApproval) console.log(`  [${level}] ${msg}`);
+  } finally {
+    await rm(noApprovalDir, { recursive: true, force: true });
+  }
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✔' : `失败 ${failures} 项 ✖`}\n`);

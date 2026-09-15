@@ -16,7 +16,7 @@
  */
 
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -28,6 +28,8 @@ import {
   checkPlanFreshness as evaluateFreshness,
   createAuditLog,
   createRedactor,
+  generateAuditKey,
+  keyIdOf,
   DEFAULT_POLICY,
   assertSafeId,
   writeJsonAtomic,
@@ -56,6 +58,9 @@ export const DEFAULT_CATALOG_DIR = join(HERE, '..', '..', 'catalog', 'actions');
 
 /** 默认审计文件轮转阈值。 */
 export const DEFAULT_MAX_AUDIT_BYTES = 8 * 1024 * 1024;
+
+/** 运行日志（`logs/run.jsonl`）默认轮转阈值。 */
+export const DEFAULT_MAX_RUN_LOG_BYTES = 8 * 1024 * 1024;
 
 /**
  * 执行被取消（M2-③）。
@@ -123,7 +128,9 @@ export function createEngine(options = {}) {
    */
   const KNOWN_CONFIG_KEYS = new Set([
     'autoAllowUpTo', 'prodEscalatesTo', 'alwaysAskFrom', 'echoHostnameAt', 'auditReadOnly',
-    'planTtlMs', 'maxAuditBytes', 'auditStartupFiles', 'maxRunBytes',
+    'planTtlMs', 'maxAuditBytes', 'auditStartupFiles', 'maxRunBytes', 'runLog', 'maxRunLogBytes',
+    // 审计 HMAC（M5）
+    'auditHmac', 'auditKey', 'auditKeyFile',
     'agentScriptPath', 'transport', 'hostKeyPolicy', 'connectTimeoutMs', 'commandTimeoutMs',
     'dailyReport', 'reportAtUtc', 'reportRetentionDays', 'reportTargets', 'tickMs',
     'heartbeat', 'heartbeatIntervalMs', 'heartbeatTimeoutMs',
@@ -169,6 +176,8 @@ export function createEngine(options = {}) {
     planTtlMs: 5 * 60 * 1000,
     /** 审计文件轮转阈值。 */
     maxAuditBytes: DEFAULT_MAX_AUDIT_BYTES,
+    /** 运行日志（logs/run.jsonl）的轮转阈值。 */
+    maxRunLogBytes: DEFAULT_MAX_RUN_LOG_BYTES,
     /** 单次运行记录（runs/*.log）的落盘上限。 */
     maxRunBytes: MAX_RUN_BYTES,
     /** 单文件读取上限（启动时最多回溯几个轮转文件做连续性校验）。 */
@@ -183,6 +192,11 @@ export function createEngine(options = {}) {
     maxRunBytes: Number.isInteger(rawConfig.maxRunBytes) && rawConfig.maxRunBytes > 0
       ? rawConfig.maxRunBytes
       : MAX_RUN_BYTES,
+    // ⚠️ 这个默认值不能省：`size <= undefined` 恒为 false，会导致**每次写入都轮转**
+    //    （实测症状：运行日志永远只有一行 —— 每写一条就把上一条挪走）。
+    maxRunLogBytes: Number.isInteger(rawConfig.maxRunLogBytes) && rawConfig.maxRunLogBytes > 0
+      ? rawConfig.maxRunLogBytes
+      : DEFAULT_MAX_RUN_LOG_BYTES,
   };
 
   /** 透传给 buildPlan 的审批策略：只有**已核实**的字段才生效，其余用默认。 */
@@ -254,18 +268,119 @@ export function createEngine(options = {}) {
     return { files: selected, records, corrupt };
   }
 
+  // ── 审计密钥（M5）：让"篡改可检出"升级为"伪造需要密钥" ──────────────────
+  //
+  // 三级来源，优先级从高到低：
+  //   ① `config.auditHmac === false` → 明确不用（旧行为；链仍可检出改动，但挡不住"重算整条链"）
+  //   ② `config.auditKey` 显式给字符串 → 用它（适合从凭据库/外部注入）
+  //   ③ 否则用密钥文件（`config.auditKeyFile`，默认 `<storageDir>/audit-hmac.key`，**不存在则生成**）
+  //
+  // ⚠️ 密钥文件的问题要**说清楚而不是硬失败**：读不到/写不了时退化为无密钥，
+  //    并记 `configWarnings` + 审计事件。绝不能因为一个密钥文件让插件（乃至整棵树）加载失败。
+  // ⚠️ 同目录的密钥对手里已有该目录读权限的攻击者不构成保护 —— 这是**诚实的边界**，
+  //    想更强就把 `auditKeyFile` 指到别处，或经 `auditKey` 从凭据库注入（见 README）。
+  const AUDIT_KEY_FILE = typeof config.auditKeyFile === 'string' && config.auditKeyFile
+    ? config.auditKeyFile
+    : join(dir, 'audit-hmac.key');
+  let auditKey = null;
+  let auditKeySource = 'none';
+  if (config.auditHmac === false) {
+    auditKeySource = 'disabled';
+  } else if (typeof config.auditKey === 'string' && config.auditKey) {
+    auditKey = config.auditKey;
+    auditKeySource = 'config';
+  } else {
+    try {
+      if (existsSync(AUDIT_KEY_FILE)) {
+        const existing = readFileSync(AUDIT_KEY_FILE, 'utf8').trim();
+        if (/^[0-9a-f]{32,}$/i.test(existing)) {
+          auditKey = existing;
+          auditKeySource = 'file';
+        } else {
+          configWarnings.push(`审计密钥文件内容不是十六进制密钥，已忽略：${AUDIT_KEY_FILE}`);
+        }
+      } else {
+        const generated = generateAuditKey();
+        mkdirSync(dirname(AUDIT_KEY_FILE), { recursive: true, mode: 0o700 });
+        writeFileSync(AUDIT_KEY_FILE, `${generated}\n`, { encoding: 'utf8', mode: 0o600 });
+        try { chmodSync(AUDIT_KEY_FILE, 0o600); } catch { /* Windows 上无 POSIX 位，忽略 */ }
+        auditKey = generated;
+        auditKeySource = 'generated';
+      }
+    } catch (err) {
+      // 退化为无密钥：仍然可用，但必须留下痕迹（否则"以为有 HMAC 保护"是最危险的错觉）
+      configWarnings.push(
+        `审计密钥不可用（${err?.message ?? err}），本次以**无密钥**方式记录：`
+        + '链仍可检出改动，但挡不住"重算整条链"的伪造。',
+      );
+      auditKeySource = 'unavailable';
+    }
+  }
+  const auditKeyIdValue = keyIdOf(auditKey);
+
   const startup = readAuditSequence({ maxFiles: config.auditStartupFiles });
   // 先校验完整（含跨轮转接续），再装载窗口 —— 顺序很重要，
   // 否则裁剪窗口会让校验起点不对，把"裁剪"误报成"篡改"。
   const historyCheck = startup.records.length
-    ? { ...verifyChain(startup.records, GENESIS), files: startup.files.length }
-    : { ok: true, length: 0, files: 0 };
+    ? { ...verifyChain(startup.records, GENESIS, { key: auditKey }), files: startup.files.length }
+    : { ok: true, length: 0, files: 0, forgeryResistant: Boolean(auditKey) };
 
-  const audit = createAuditLog({ maxRecords: options.maxAuditRecords });
+  const audit = createAuditLog({ maxRecords: options.maxAuditRecords, key: auditKey });
   audit.hydrate(startup.records);
 
   let auditDegraded = null;
   let rotations = rotatedFiles().length;
+
+  // ── 运行日志（技术债 #13）──────────────────────────────────────────────
+  //
+  // 与审计**分工不同**，不是同一份东西的两种写法：
+  //   · 审计（logs/audit.jsonl）是**证据**：带哈希链、逐条可校验、面向"事后取证"；
+  //   · 运行日志（logs/run.jsonl）是**可读流**：带 level、面向"人看和 grep"。
+  // 所以这里刻意**不放进哈希链**（放进去等于让日志格式变更破坏证据链），
+  // 只把"发生了什么"按人类习惯写一行。
+  const runLogFile = join(logDir, 'run.jsonl');
+
+  /** 事件 → 日志级别。判断依据是"这件事是否需要人注意"，而不是事件名长短。 */
+  function levelOf(event) {
+    if (/(\.failed|\.error|\.blocked|\.mismatch|\.stale|degraded|corrupt)/.test(event)) return 'error';
+    if (/(\.warn|unavailable|skipped|rolledBack|cancelled|no-session|rotate)/.test(event)) return 'warn';
+    return 'info';
+  }
+
+  function rotateRunLogIfNeeded() {
+    let size = 0;
+    try {
+      size = statSync(runLogFile).size;
+    } catch {
+      return null;                          // 还没这个文件
+    }
+    if (size <= config.maxRunLogBytes) return null;
+    // 只保留一代历史（`run.0001.jsonl`）—— 运行日志是给人看的，不值得像审计那样多代留存
+    const target = join(logDir, 'run.0001.jsonl');
+    try {
+      if (existsSync(target)) renameSync(target, `${target}.old`);
+      renameSync(runLogFile, target);
+      try { if (existsSync(`${target}.old`)) renameSync(`${target}.old`, target); } catch { /* 尽力 */ }
+    } catch {
+      /* 轮转失败不该影响记录本身 */
+    }
+    return target;
+  }
+
+  /** 把一条已脱敏的审计记录同步写进运行日志（失败只降级，不影响审计）。 */
+  function appendRunLog(chained) {
+    if (config.runLog === false) return;
+    try {
+      rotateRunLogIfNeeded();
+      const { prev, hash, ...rest } = chained;
+      // 链条字段不进运行日志：它们属于审计，混进来只会让人以为这是证据文件
+      appendFileSync(runLogFile, `${JSON.stringify({ level: levelOf(chained.event), ...rest })}\n`, 'utf8');
+    } catch (err) {
+      runLogDegraded = err?.message ?? String(err);
+    }
+  }
+
+  let runLogDegraded = null;
 
   // ── 写互斥（F9）────────────────────────────────────────────────────────
   let writeChain = Promise.resolve();
@@ -289,8 +404,7 @@ export function createEngine(options = {}) {
   const heartbeatFailure = new Map();
 
   /** 审计文件超阈值时轮转；跨文件哈希链接续（I6）。 */
-  function rotateAuditIfNeeded() {
-    let size = 0;
+  function rotateAuditIfNeeded() {    let size = 0;
     try {
       size = statSync(auditFile).size;
     } catch {
@@ -330,6 +444,13 @@ export function createEngine(options = {}) {
     policy,
     /** 配置层面的问题（未知键、非法值、比默认更宽松的策略…），供工具与台账展示。 */
     configWarnings,
+    /** 审计是否启用了 HMAC（M5），以及密钥指纹 / 来源（**不含密钥本身**）。 */
+    get auditKeyId() {
+      return auditKeyIdValue;
+    },
+    auditKeySource,
+    auditHmacEnabled: Boolean(auditKey),
+    auditKeyFile: AUDIT_KEY_FILE,
     transport,
     controllerHandlers,
     factsByTarget,
@@ -371,6 +492,7 @@ export function createEngine(options = {}) {
       const chained = audit.append({ event, ...payload });
       try {
         appendFileSync(auditFile, `${JSON.stringify(chained)}\n`, 'utf8');
+        appendRunLog(chained);
       } catch (err) {
         auditDegraded = err?.message ?? String(err);
       }
@@ -393,12 +515,14 @@ export function createEngine(options = {}) {
     /** 完整校验：读取全部轮转文件 + 当前文件，逐条验证（含跨文件接续）。 */
     verifyAuditFull() {
       const all = readAuditSequence();
-      const v = verifyChain(all.records, GENESIS);
+      const v = verifyChain(all.records, GENESIS, { key: auditKey });
       return {
         ...v,
         files: all.files.map((f) => basename(f)),
         corruptLines: all.corrupt,
         degraded: auditDegraded,
+        keyId: auditKeyIdValue,
+        keySource: auditKeySource,
       };
     },
 
@@ -1070,6 +1194,11 @@ export function createEngine(options = {}) {
     planTtlMs: config.planTtlMs,
     maxAuditBytes: config.maxAuditBytes,
     maxRunBytes: config.maxRunBytes,
+    // 审计是否被密钥保护（**只记指纹与来源，绝不记密钥**）——
+    // 这是"事后能回答'当时的审计链到底抗不抗伪造'"的唯一依据
+    auditHmac: Boolean(auditKey),
+    auditKeyId: auditKeyIdValue,
+    auditKeySource,
     warningCount: configWarnings.length,
   });
   for (const warning of configWarnings) engine.record('config.warning', { warning });

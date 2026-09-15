@@ -360,7 +360,8 @@ export function createTools(engine, ctx) {
             canExecute: { type: 'boolean' },
             targets: { type: 'array' },
             audit: { type: 'object' },
-            warnings: { type: 'array', description: '配置层面的问题（未知键、非法值、更宽松的策略等）' },
+            warnings: { type: 'array', description: '配置与组合层面的问题（未知键、非法值、审批服务不可用等）' },
+            approvalAvailable: { type: 'boolean', description: '审批服务是否可用（不可用时 R2/R3 会被拒绝执行）' },
           },
           required: ['connectionState', 'canExecute', 'targets'],
         },
@@ -425,7 +426,15 @@ export function createTools(engine, ctx) {
             lastSeenAt: t.lastSeenAt,
           })),
           audit: engine.verifyAudit(),
-          warnings: engine.configWarnings ?? [],
+          warnings: [
+            // I5：审批服务不可用属于"组合/配置"层面的问题，必须与其它配置警告一起出现在对话里 ——
+            // 否则用户只会看到"R2/R3 执行不了"，猜不到原因
+            ...(ctx?.approval && typeof ctx.approval.request === 'function'
+              ? []
+              : ['审批服务（ctx.approval）不可用：R0/R1 动作可用，R2/R3 一律拒绝执行（fail-closed）']),
+            ...(engine.configWarnings ?? []),
+          ],
+          approvalAvailable: Boolean(ctx?.approval && typeof ctx.approval.request === 'function'),
         };
       },
     },
@@ -711,13 +720,21 @@ export function createTools(engine, ctx) {
           required: ['events', 'chain', 'total'],
         },
         render: (_args, value) => {
-          const head = value.chain.ok
-            ? `审计链完好（共 ${value.total} 条）`
-            : `⚠ 审计链已损坏：第 ${value.chain.brokenAt} 条起断链（${value.chain.reason}）`;
+          const c = value.chain;
+          // 链的强度必须说清楚（M5）：无密钥的 sha256 链只能"检出改动"，
+          // 不能挡"重算整条链"的伪造 —— 这句话不能只写在文档里，得出现在每次查看时。
+          const strength = c.keyed
+            ? (c.forgeryResistant
+              ? ` · 密钥保护（keyId ${c.keyId}，抗伪造）`
+              : ` · 密钥保护中（keyId ${c.keyId}；另有 ${c.legacyCount} 条旧的无密钥记录，那段只可检出改动）`)
+            : ' · ⚠ 无密钥：可检出改动，但挡不住"重算整条链"的伪造';
+          const head = c.ok
+            ? `审计链完好（共 ${value.total} 条${c.truncated ? `，内存窗口已裁剪 ${c.truncated} 条` : ''}）${strength}`
+            : `⚠ 审计链已损坏：第 ${c.brokenAt} 条起断链（${c.reason}）`;
           if (!value.events.length) return text(`${head}\n\n暂无匹配记录。`);
           const rows = value.events.map((e) => {
             const brief = Object.entries(e)
-              .filter(([k]) => !['ts', 'prev', 'hash', 'event'].includes(k))
+              .filter(([k]) => !['ts', 'prev', 'hash', 'event', 'algo', 'keyId'].includes(k))
               .map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
               .join(' ');
             return `${e.ts}  ${e.event}  ${brief}`;

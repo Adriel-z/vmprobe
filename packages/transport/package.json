@@ -1,6 +1,6 @@
 {
   "name": "@vmprobe/transport",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "VMProbe 传输层：SSH 连接复用、命令执行、文件推送、主机密钥校验。",

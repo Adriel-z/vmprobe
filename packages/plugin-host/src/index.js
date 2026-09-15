@@ -36,16 +36,26 @@ export const DEFAULT_AGENT_SCRIPT = join(HERE, '..', '..', '..', 'agent', 'boots
 export const name = 'vmprobe';
 
 /**
- * 静态注入。缺失即组合错误（fail-fast），避免运行时空引用。
+ * 静态注入。缺失即"插件不运行"（cordis 语义：`inject` 里的服务必须先就绪）。
  *
- * `tools` 与 `approval` 是**核心必需**：没有批准环节就无法安全执行 R2/R3，
- * 因此宁可插件加载失败，也不要在缺少审批器的情况下运行。
+ * ── I5 决策（第七轮）：`approval` **刻意不再是必需注入** ────────────────────
  *
- * ⚠️ 刻意**不注入 `timer`**：定时日报是可选特性，而工具能力是核心。
- * 只因为可选特性缺依赖就让整个插件加载失败是不合理的 ——
- * 所以定时器在 `scheduler.js` 里做能力守卫并明确告警（不静默）。
+ * 原来写的是 `inject = ['tools', 'approval']`，理由是"没有审批器就无法安全执行 R2/R3"。
+ * 理由没错，但**手段错了**：`inject` 里的服务未就绪时，本插件的 `apply()` 根本不会执行 ——
+ * 表现为工具一个都没注册，甚至那条 loader entry 加载失败（而**任何一条 entry 失败都会让整棵树
+ * 加载不出来**，见 `DEVELOPMENT.md` §5.2 坑 6）。一个可选服务的缺失不该有这个权力。
+ *
+ * 改为：**加载时永不阻塞，执行时严格 fail-closed**。
+ *   · `tools` 仍是必需（没有它插件什么也做不了，失败是应该的）；
+ *   · `approval` 缺失时插件照常加载并注册工具，但：
+ *       - R0/R1（免弹动作）照常执行 —— 它们本来就不需要审批；
+ *       - R2/R3 一律拒绝执行，并明确说明"审批服务不可用，按 fail-closed 拒绝"；
+ *       - 加载台账与 `vmprobe_status` 都会显示"审批服务不可用"，**不静默**。
+ * 安全属性没有变弱（没有审批就绝不执行特权且不可逆的动作），但消除了"缺服务即整棵树失败"的隐患。
+ *
+ * ⚠️ 同理刻意**不注入 `timer`**：定时日报是可选特性，缺依赖时只告警不阻塞。
  */
-export const inject = ['tools', 'approval'];
+export const inject = ['tools'];
 
 /** 默认存储目录：尊重 DSH_HOME，与 DSH 自身的数据布局保持一致（推演发现 F11）。 */
 export const DEFAULT_STORAGE_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'vmprobe');
@@ -215,6 +225,22 @@ export function apply(ctx, config = {}) {
     maxRunBytes: engine.config.maxRunBytes,
     warningCount: engine.configWarnings.length,
   });
+
+  // ---- 审批服务可用性（I5）：**必须显式可见**，不能靠"R2/R3 莫名被拒"才发现 ----
+  //
+  // 决策见文件头：approval 是可选注入，缺失时插件照常加载，但 R2/R3 会被 fail-closed 拒绝。
+  // 既然选择了"不阻塞加载"，就有义务把"审批不可用"这件事说清楚 ——
+  // 否则用户只会看到"特权动作执行不了"，猜不到原因。
+  const approvalAvailable = () => Boolean(ctx.approval && typeof ctx.approval.request === 'function');
+  if (!approvalAvailable()) {
+    ctx.logger?.warn?.(
+      'vmprobe: 审批服务（ctx.approval）不可用 —— 插件已加载，R0/R1 只读与可逆动作可用，'
+      + 'R2/R3 特权动作将按 fail-closed 一律拒绝执行，直到审批服务就绪。',
+    );
+    ledger('approval.unavailable', { note: 'R2/R3 将被拒绝执行（fail-closed）' });
+  } else {
+    ledger('approval.available');
+  }
 
   // ---- 注册工具 ----
   const tools = createTools(engine, ctx);

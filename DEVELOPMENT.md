@@ -4,7 +4,7 @@
 > **本文记录两件事**：① 现在做到哪了（带证据）；② 接下来往哪做、怎么做。
 >
 > 配套文档：`README.md`（安装使用）· `DESIGN.md`（架构与设计决策）· `ISSUES.md`（缺陷台账）
-> 代码规模：`packages/**/src` **5479 行** · 单测 **143 项**（含 1762 行测试代码）· 推演探测点 21 个 · SSH 端到端 27 项 · 协从端脚本 558 行
+> 代码规模：`packages/**/src` **6469 行** · 单测 **174 项**（含 2308 行测试代码）· 推演探测点 21 个 · SSH 端到端 27 项 · 归档检查 12 项 · 协从端脚本 558 行
 
 ---
 
@@ -165,7 +165,11 @@ DSH 启动
 | **审批策略真正生效（技术债 #1）** | ✅ 完成 | core 的 `decideApproval` 现在同时看 `autoAllowUpTo` 与 `alwaysAskFrom`（默认行为不变）；插件把策略透传进 `buildPlan`；启动写 `config.effective` 审计；未知/非法/更宽松的配置键**三重可见**（logger + 台账 + `vmprobe_status`） |
 | **日报保留策略接定时器（技术债 #5）** | ✅ 完成 | 每天生成后顺带清理一次，幂等键 = UTC 日键；清理失败不影响生成但明确告警 |
 | **DSH 运行时依赖可移植解析（技术债 #10）** | ✅ 完成 | 新增 `tools/lib/dsh-runtime.mjs`：按 `DSH_RUNTIME_ROOT` → `dsh` 可执行文件 → Node 前缀逐层探测（含 DSH 自身嵌套依赖）；**四个工具里写死的本机绝对路径全部消除** |
-| **心跳保活与连接健康观测** | ✅ 完成 | `scheduler.js` 的 `startTransportHeartbeat`：60s 一次、5s 超时、**只探活跃会话**（绝不主动拉连接，否则"心跳"会掩盖"其实早就断了"）；`vmprobe_status` 显示延迟/失败次数/最初失败原因；审计只在**状态变化**时落一条（成功首次、失败首次、持续失败每 10 次、恢复各一条）——探测点覆盖"不淹没日志" |
+| **心跳保活与连接健康观测** | ✅ 完成 | `scheduler.js` 的 `startTransportHeartbeat`：60s 一次、5s 超时、**只探活跃会话**（绝不主动拉连接，否则"心跳"会掩盖"其实早就断了"）；`vmprobe_status` 显示延迟/失败次数/最初失败原因；审计只在**状态变化**时落一条 |
+| **I5 决策落地：approval 改为可选注入** | ✅ 完成 | `inject=['tools']`；缺审批时插件照常加载、R0/R1 照常执行、**R2/R3 一律拒绝且 `transport.apply` 调用次数为 0**；日志+台账+状态三重可见（DESIGN D14） |
+| **审计链 HMAC（M5 部分）** | ✅ 完成 | 逐条 `algo`/`keyId`、禁止降级、换密钥≠被篡改、旧链完全兼容；12 项单测；启动时把"实际生效的密钥指纹与来源"写进审计（DESIGN D15） |
+| **归档与迁移（M3）** | ✅ 完成 | `.vmpz` = 标准 zip（自研容器 ~200 行，零依赖）+ 清单 sha256 + schema 版本校验 + 脱敏档位 + 私钥强制加密（scrypt+AES-GCM）+ 导入差异预览与备份；**审计密钥与私钥永不入档**；15 项单测 + **PowerShell `Expand-Archive` 外部交叉验证** |
+| **运行日志 `logs/run.jsonl`（技术债 #13）** | ✅ 完成 | 与审计分工：带 `level`、**不入哈希链**、只留一代历史（DESIGN D16）；4 项单测含"不得每次写入都轮转"的回归 |
 | **认证切换记住原凭据** | ✅ 完成 | `switchTargetAuth` 会记 `previousAuthRef`（仅当原来是口令/密码时），否则撤销免密会因为"口令 ref 已被覆盖"而**拒绝执行**（fail-closed 但不可用）；往返测试：启用免密 → 撤销免密 → 仅用口令重新连上 |
 | 协从端 facts 采集（含 load/hw/包状态） | ✅ 完成 | `--check` 输出合法 JSON；`pkg.upgradable`/`securityUpgradable`/`kernelUpgradePending` 一次查询产出；缺失记 null |
 | 协从端安装完整性守卫 | ✅ 完成 | `check-install-guard.sh` 8 项 |
@@ -178,12 +182,11 @@ DSH 启动
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | 快照 / 回滚 | ⛔ 未开始 | `rollback.strategy` 与 `snapshotCapable` 已采集，但没有落地动作 |
-| 协从端本地审计 + 双端交叉核对 | ⛔ 未开始 | 需要 agent 二进制（Go）与协议 |
-| 归档导入导出 | ⛔ 未开始 | 设计 §11（M3） |
+| 协从端本地审计 + 双端交叉核对 | ⛔ 未开始 | 需要 agent 二进制（Go）与协议 || 归档导入导出 | ⛔ 未开始 | 设计 §11（M3） |
 | T2 白名单命令 / T3 原始 shell | ⛔ 未开始 | 设计 D1 的档位，默认关闭；`allowRawShell` 配置键会被**明确拒绝并告警**，不静默接受 |
 | 纯 JS 的 `docker exec` / 本地传输后端 | ⛔ 未开始 | 用于"在同一台机器上跑"或容器场景，测试也更好写 |
 | 客户端 UI 插件（浏览器侧） | ⛔ **受环境阻塞**（见 §9 #11） | 本机发行版里**没有客户端打包器**、客户端 peer 包也**未发布到 npm**；宿主侧已先把同样的信息做进对话（结果卡片 + 状态里的配置警告） |
-| `run.jsonl` 生命周期日志 | ⛔ 未开始 | 事件当前在审计链与加载台账里，尚未单独落一份运行日志文件 |
+| 协从端守护进程 / 本地定时（M4） | ⛔ **刻意推迟** | 见 §10 M4：它的价值全在"Linux 上的 sshd/systemd/unix socket 行为"，而这些在本机**无法验证**（没有 Linux 目标）。按"能验证才敢说已实现"的纪律，宁可不写也不写个只能半验的守护进程 |
 
 ---
 
@@ -503,7 +506,7 @@ export const DEFAULT_POLICY = Object.freeze({
 
 ## 7. 测试与调试
 
-### 7.1 七层检查
+### 7.1 八层检查
 
 ```powershell
 npm run check          # 全套
@@ -511,10 +514,11 @@ npm run check          # 全套
 
 | 层 | 命令 | 性质 |
 |---|---|---|
-| 单元测试 | `npm run test` | 纯逻辑，**143 项**（core 113 + transport 9 + plugin-host 21），毫秒级 |
+| 单元测试 | `npm run test` | 纯逻辑，**174 项**（core 132 + transport 9 + plugin-host 33），毫秒级 |
 | 插件契约 | `npm run check:plugin` | mock ctx 上跑 `apply()`；**并用 DSH 自己的 schema 校验器验 `output.schema`/`parameters` 子集**（不用启动就能拦住"整棵树加载失败"这类错） |
 | 故障推演 | `npm run check:faults` | 21 个探测点，用假传输层走真实执行路径 |
 | **SSH 端到端** | `npm run check:ssh` | **真实 ssh2 服务端** + Git bash 作为远端 shell：握手/认证/主机密钥/exec/stdin/文件/超时 + 免密事务（含失败回滚）+ 心跳三态（成功/干净断开/静默死亡）+ **M2 的 verify 四情形与取消贯通**（27 项） |
+| **归档** | `npm run check:archive` | 导出 → **外部实现交叉验证**（PowerShell `Expand-Archive`）→ 导入干净目录逐文件比对 → 私钥加密与错误口令（12 项） |
 | 文档一致性 | `npm run check:docs` | 确认文档提到的项目内路径真实存在 |
 | 环境预检 | `npm run check:doctor`（或 `npm run doctor`） | 离线检查 DSH 环境（凭据 / bundles / id 冲突 / 活实例） |
 | 协从端脚本 | `npm run check:agent` | 语法 + 转义 + 安装守卫（自动定位 bash，无需改 PATH） |
@@ -671,11 +675,11 @@ Get-Content "$env:USERPROFILE\.dsh\vmprobe\loads.jsonl" -Tail 3
 | 6 | ~~运行输出体没有独立文件~~ ✅ **已修（M2）** | — | 见 D7.6：`runs/<runId>.log` + sha256 入审计 |
 | 7 | **只有 SSH 一个传输后端** | 想在同一台机器/容器里验证或使用，得先起 sshd | 加一个 `local`（直接 spawn）与 `docker exec` 后端；测试也更好写 |
 | 8 | **plan TTL（默认 5 分钟）与人工审批耗时的张力** | 用户思考超过 5 分钟，计划就过期，模型需重新计划并**重新申请审批** | 这是刻意的（环境可能已变）。但要在工具描述与渲染里把"请重新计划"讲清楚 |
-| 9 | **`I5` 待决策**：`approval` 是否保持必需注入 | 现在 `inject = ['tools','approval']`，没有 approval 的 profile 里插件加载失败 | 判断：没有审批器就无法安全执行 R2/R3，**建议保持必需**（唯一待用户拍板项） |
+| 9 | ~~`I5` 待决策：`approval` 是否保持必需注入~~ ✅ **已决策并落地** | — | 改为 `inject=['tools']`：**加载不阻塞、执行时 fail-closed**（DESIGN D14）。原方案"缺审批就不加载"的理由没错、手段错了 —— 一个可选服务的缺失不该有让整棵树加载失败的权力（ISSUES §13.1） |
 | 10 | ~~宿主 `yaml` / `dsh-tools` 由绝对路径加载~~ ✅ **已修（M2）** | — | 见 `tools/lib/dsh-runtime.mjs`：按环境变量 → `dsh` 位置 → Node 前缀逐层探测，含 DSH 自身嵌套依赖；四个工具里的写死路径全部消除 |
 | 11 | **客户端 UI 插件（浏览器侧）受环境阻塞** | 没有状态徽标/设置页；凭据录入只能走命令行 | **实测证据**：发行版里没有 tsdown/esbuild/rollup/vite/tsup 任一打包器；`@deepseek-ai/dsh-client-*` 未发布到 npm；客户端 bundle 是内部格式（`window.__ModuleLoader__.load({id, factory})`）。在没有打包工具链、又不能重启用户活动实例的前提下**手写这个 bundle 属于不可验证的改动**，因此不做。替代：把同样信息做进对话（结果卡片带校验结论、`vmprobe_status` 带配置警告）+ CLI 掩码录入 |
 | 12 | 未处理的告警源：`ctx.systemPrompt.section` 签名未核实 | 基础用法提示可能没注入（完整用法仍可从 `vmprobe_catalog` 拿到） | 已做守卫 + 明确告警 |
-| 13 | **运行日志 `logs/run.jsonl` 未单独落文件** | 生命周期事件目前在审计链与加载台账里，两者都不适合当"运行日志"读 | M3 前后补一份纯运行日志（或明确取消这个设计项） |
+| 13 | ~~运行日志 `logs/run.jsonl` 未单独落文件~~ ✅ **已完成** | — | 与审计分工的独立运行日志（DESIGN D16）；已加"不得每次写入都轮转"的回归测试（ISSUES §13.3） |
 
 ---
 
@@ -710,26 +714,39 @@ Get-Content "$env:USERPROFILE\.dsh\vmprobe\loads.jsonl" -Tail 3
 `packages/plugin-host/test/runs.test.js`（7 项）、`packages/plugin-host/test/m2-engine.test.js`（14 项），
 并在真实 SSH 上加了两节（verify 四情形 + 取消贯通）。单测总数 **113 → 143**，SSH 端到端 **25 → 27 项**。
 
-### M3 —— 归档与迁移
+### M3 —— 归档与迁移 ✅ **已完成（2026-09-15）**
 
-- `.vmpz` 导出/导入（zip；清单 + sha256 + schema 版本 + 逐级迁移）
-- 默认不含凭据；`--include-secrets` 必须加密（scrypt + AES-GCM）
-- 导入前差异预览：新增/冲突/指纹变化/失效凭据
-- 脱敏档位（minimal / standard / full，内网 IP 打码）
+| # | 任务 | 结果 |
+|---|---|---|
+| ① | `.vmpz` 导出/导入 | ✅ **标准 zip**（自研容器 `packages/core/src/zip.js`，~200 行、零依赖，走 Node 自带 zlib）+ 清单 + 逐文件 sha256 + schema 版本校验 |
+| ② | 默认不含凭据；`--include-secrets` 必须加密 | ✅ 私钥默认不入档；要带就**必须**加密（scrypt + AES-256-GCM），"带秘密但不加密"直接拒绝；口令只从 TTY 或环境变量给 |
+| ③ | 导入前差异预览 | ✅ 新增 / 一致 / 冲突 / **凭据缺口** 四类；默认 `--dry-run`，`--apply` 才落盘，默认不覆盖（覆盖要 `--overwrite` 且**先备份**） |
+| ④ | 脱敏档位 | ✅ `none` / `minimal` / `standard`（IP 与主机名打码、标签清空；`authRef` 引用名保留） |
+| ⑤ | （超出原计划）**审计密钥永不入档** | ✅ 硬编码排除 + 测试盯着；否则"抗伪造"的根随归档流出去，HMAC 等于白做 |
+| ⑥ | （超出原计划）**外部实现交叉验证** | ✅ `tools/checks/check-archive.mjs` 把导出的归档交给 **PowerShell `Expand-Archive`** 解 —— 证明容器符合规范，不是"只有我自己能读"的私有格式 |
 
-### M4 —— 协从端守护进程与本地定时
+**验收**：`packages/core/test/archive.test.js`（15 项）+ `tools/checks/check-archive.mjs`（12 项断言，含外部解压）。
 
-- `--daemon` 模式：unix socket（**不监听 TCP**）+ 任务流式输出 + 断连续跑
-- 本地定时报告（控制器关机也照跑）
-- 系统级安装：systemd unit / logrotate / **窄规则 sudoers**（由动作生成，`visudo -c` 校验）
-- 多目标 fan-out（若届时需要）
+### M4 —— 协从端守护进程与本地定时 ⛔ **刻意推迟（无 Linux 目标，无法验证）**
 
-### M5 —— 硬化
+- 计划内容：`--daemon`（unix socket，不监听 TCP）+ 任务流式输出 + 断连续跑；本地定时报告；
+  systemd unit / logrotate / 窄规则 sudoers；多目标 fan-out。
+- **为什么现在不做**：这个里程碑的价值**全部**落在 Linux 特有行为上 ——
+  unix socket 权限、systemd 生命周期、logrotate、sshd 的 StrictModes/SELinux 上下文。
+  本机没有 Linux 环境（WSL 无发行版、无 docker/podman），**写了也只能验证到一半**，
+  而"半验证的守护进程"比"明确没做"更危险：它会被当成已经可靠的东西而进入生产。
+- **具备条件后**：拿到一台真实 Linux 目标即可开工，验收标准见本节表格（届时补回）。
 
-- 威胁模型逐条对策 + 测试（`DESIGN.md` §9.1 的 T1–T10）
-- 指纹固定与变更处置流程、主机密钥轮换
-- 动作目录模糊测试；T2 白名单与 T3 原始 shell 的护栏
-- 文档与真实行为的一致性审计（防止再出现 F10 那种"目录承诺了不存在的命令"）
+### M5 —— 硬化 🟡 **部分完成**
+
+| 项 | 状态 |
+|---|---|
+| **审计链 HMAC**（抗伪造，含降级规则与密钥轮换边界） | ✅ 已完成（DESIGN D15，12 项单测） |
+| 运行日志与审计分工（避免日志格式变更破坏证据链） | ✅ 已完成（DESIGN D16） |
+| 威胁模型逐条对策 + 测试（§9.1 的 T1–T10） | ⏳ 待办 |
+| 指纹固定与变更处置流程、主机密钥轮换动作 | ⏳ 待办（指纹固定已实现，轮换动作未做） |
+| 动作目录模糊测试；T2 白名单与 T3 原始 shell 的护栏 | ⏳ 待办（T3 现在被明确拒绝，见技术债 #1） |
+| 文档与真实行为的一致性审计 | 🟡 持续做（`check:docs` 只查路径存在，查不了语义漂移） |
 
 ---
 

@@ -12,6 +12,8 @@ export {
 
 export {
   GENESIS,
+  ALGO_SHA256,
+  ALGO_HMAC,
   canonicalJson,
   hashRecord,
   sha256Hex,
@@ -19,7 +21,34 @@ export {
   tailHash,
   verifyChain,
   createAuditLog,
+  generateAuditKey,
+  keyIdOf,
 } from './audit.js';
+
+export {
+  crc32,
+  zipCreate,
+  zipRead,
+  zipEntry,
+  ZipError,
+} from './zip.js';
+
+export {
+  ARCHIVE_SCHEMA,
+  MANIFEST_NAME,
+  SECRETS_NAME,
+  NEVER_ARCHIVE,
+  SECRET_PATHS,
+  REDACTION_LEVELS,
+  redactValue,
+  collectEntries,
+  encryptSecrets,
+  decryptSecrets,
+  exportArchive,
+  readArchive,
+  diffArchive,
+  applyImport,
+} from './archive.js';
 
 export {
   assertSecretFree,

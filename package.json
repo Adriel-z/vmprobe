@@ -1,7 +1,7 @@
 {
   "name": "vmprobe",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "VMProbe — 单台云服务器探针（主控端 DSH 插件 + Linux 协从端）",
   "type": "module",
   "engines": {
@@ -9,16 +9,19 @@
   },
   "scripts": {
     "test": "node --test packages/core/test/ packages/transport/test/ packages/plugin-host/test/",
-    "check": "npm run test && npm run check:plugin && npm run check:faults && npm run check:ssh && npm run check:docs && npm run check:doctor && npm run check:agent",
+    "check": "npm run test && npm run check:plugin && npm run check:faults && npm run check:ssh && npm run check:archive && npm run check:docs && npm run check:doctor && npm run check:agent",
     "check:plugin": "node tools/checks/verify-plugin.mjs",
     "check:faults": "node tools/checks/simulate-faults.mjs",
     "check:ssh": "node tools/checks/ssh-transport.mjs",
+    "check:archive": "node tools/checks/check-archive.mjs",
     "check:docs": "node tools/checks/check-docs.mjs",
     "check:doctor": "node tools/doctor.mjs",
     "check:agent": "node tools/checks/run-agent-checks.mjs",
     "doctor": "node tools/doctor.mjs",
     "cred": "node tools/vmprobe-cred.mjs",
+    "archive": "node tools/vmprobe-archive.mjs",
     "fix:credentials": "node tools/fix-credentials.mjs",
+    "release": "node tools/release/publish.mjs",
     "verify:config": "dsh --profile web --patch tools/overlay.yml --dump-config"
   }
 }

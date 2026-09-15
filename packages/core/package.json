@@ -1,6 +1,6 @@
 {
   "name": "@vmprobe/core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "VMProbe 核心逻辑：风险策略、审计哈希链、免密存储。零 DSH 依赖，可独立单测。",

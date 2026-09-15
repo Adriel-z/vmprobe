@@ -162,7 +162,7 @@ async function ensureGitee(token, login, tag, body) {
  *   ② 推送前后都断言"临时凭据文件确实在预期位置"；
  *   ③ 推送后**扫描仓库工作区**里有没有漏出来的凭据文件，有就删掉并大声报错（见 assertNoStrayCreds）。
  */
-function pushWithTempCreds(remoteUrl, refs, tokens) {
+async function pushWithTempCreds(remoteUrl, refs, tokens) {
   const tmpDir = mkdtempSync(join(tmpdir(), 'vmprobe-git-'));
   // ① 正斜杠路径（Windows 上反斜杠会被 git 当转义符）
   const credFile = join(tmpDir, '.git-credentials').replace(/\\/g, '/');
@@ -177,11 +177,67 @@ function pushWithTempCreds(remoteUrl, refs, tokens) {
   // ② 断言文件在预期位置（否则就是转义又出问题了，绝不能继续）
   if (!existsSync(credFile)) throw new Error(`临时凭据文件未落在预期位置：${credFile}`);
 
+  /**
+   * 代理支持。
+   *
+   * 这台机器上 github.com 的直连**时常被重置**（实测：同一天里 v0.2.0 能直推，
+   * 几小时后 v0.3.0 就 `Recv failure: Connection was reset`）。所以：
+   *   · 显式给 `VMPROBE_GIT_PROXY` 就用它；
+   *   · 否则探测本机常见代理端口（7890/7891），**通了才用**；
+   *   · 都没有就直连 —— 不因为"猜有代理"而把本来能成的直连搞坏。
+   */
+  const proxyArgs = [];
+  const explicitProxy = process.env.VMPROBE_GIT_PROXY;
+  let proxy = explicitProxy ?? null;
+  if (!proxy) {
+    for (const port of [7890, 7891]) {
+      try {
+        execFileSync('node', [
+          '-e',
+          `require('net').connect(${port},'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))`,
+        ], { stdio: 'pipe', timeout: 2000 });
+        proxy = `http://127.0.0.1:${port}`;
+        break;
+      } catch { /* 这个端口没有代理，试下一个 */ }
+    }
+  }
+  if (proxy) {
+    proxyArgs.push('-c', `http.proxy=${proxy}`, '-c', `https.proxy=${proxy}`);
+    log(`  使用代理 ${proxy}${explicitProxy ? '（VMPROBE_GIT_PROXY）' : '（自动探测到本机代理）'}`);
+  }
+
+  /**
+   * 推送带重试：网络抖动是常态，一次抖动不该把发布留成半成品。
+   * git 的原始报错**原样打出来** —— 不看它，就分不清"网络问题"与"权限问题"。
+   */
+  const attempts = 3;
+  let lastErr = null;
   try {
-    execFileSync('git', [
-      '-c', `credential.helper=store --file=${credFile}`,
-      'push', remoteUrl, ...refs,
-    ], { cwd: ROOT, stdio: 'inherit' });
+    for (let i = 1; i <= attempts; i += 1) {
+      try {
+        execFileSync('git', [
+          '-c', `credential.helper=store --file=${credFile}`,
+          ...proxyArgs,
+          'push', remoteUrl, ...refs,
+        ], { cwd: ROOT, stdio: 'inherit' });
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (i < attempts) {
+          log(`  推送失败（第 ${i}/${attempts} 次）：${String(err.stderr ?? err.message).trim().split('\n').pop()}`);
+          log('  2 秒后重试…');
+          // ⚠️ 这个 sleep **不能 unref**：unref 过的定时器不维持事件循环，
+          //    顶层 await 会先看到"没有待处理任务"而让进程提前退出
+          //    （实测报 `Detected unsettled top-level await`，重试根本没发生）。
+          await new Promise((r) => setTimeout(r, 2000));
+        }
+      }
+    }
+    throw new Error(
+      `推送到 ${remoteUrl} 失败（已重试 ${attempts} 次）：${String(lastErr?.stderr ?? lastErr?.message).trim()}\n`
+      + '  若是连接被重置，可设 VMPROBE_GIT_PROXY=http://127.0.0.1:7890（本机代理）后重试；\n'
+      + '  本脚本是幂等的：重跑不会重复建仓、不会重复发 release。',
+    );
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
     // ③ 兜底扫描：任何漏进工作区的凭据文件都要立刻消失并报警
@@ -305,32 +361,46 @@ log(`  GitHub: ${ghLogin ?? '（未配置 → 跳过）'}`);
 log(`  Gitee : ${gtLogin ?? '（未配置 → 跳过）'}`);
 
 const results = { github: null, gitee: null };
+/** 各平台的失败原因（一个平台不通**不该**让另一个也不发）。 */
+const failures = [];
 
 if (ghLogin) {
   step('GitHub');
-  await ensureGithub(githubToken, ghLogin, tag, body);
-  if (apply) {
-    pushWithTempCreds(
-      `https://github.com/${ghLogin}/${REPO}.git`,
-      ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
-      [{ login: ghLogin, token: githubToken }],
-    );
-    log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
-    results.github = await createGithubRelease(githubToken, ghLogin, tag, body);
+  try {
+    await ensureGithub(githubToken, ghLogin, tag, body);
+    if (apply) {
+      await pushWithTempCreds(
+        `https://github.com/${ghLogin}/${REPO}.git`,
+        ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
+        [{ login: ghLogin, token: githubToken }],
+      );
+      log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
+      results.github = await createGithubRelease(githubToken, ghLogin, tag, body);
+    }
+  } catch (err) {
+    // 记下来继续走 Gitee —— 两端的连通性往往不一样（实测 GitHub 会被重置，Gitee 正常）
+    failures.push({ platform: 'GitHub', message: String(err.message).split('\n')[0] });
+    log(`  ✖ GitHub 失败：${String(err.message).split('\n')[0]}`);
+    log('    （继续处理 Gitee —— 两端连通性互不影响；本脚本可幂等重跑）');
   }
 }
 
 if (gtLogin) {
   step('Gitee');
-  await ensureGitee(giteeToken, gtLogin, tag, body);
-  if (apply) {
-    pushWithTempCreds(
-      `https://gitee.com/${gtLogin}/${REPO}.git`,
-      ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
-      [{ login: gtLogin, token: giteeToken }],
-    );
-    log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
-    results.gitee = await createGiteeRelease(giteeToken, gtLogin, tag, body);
+  try {
+    await ensureGitee(giteeToken, gtLogin, tag, body);
+    if (apply) {
+      await pushWithTempCreds(
+        `https://gitee.com/${gtLogin}/${REPO}.git`,
+        ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
+        [{ login: gtLogin, token: giteeToken }],
+      );
+      log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
+      results.gitee = await createGiteeRelease(giteeToken, gtLogin, tag, body);
+    }
+  } catch (err) {
+    failures.push({ platform: 'Gitee', message: String(err.message).split('\n')[0] });
+    log(`  ✖ Gitee 失败：${String(err.message).split('\n')[0]}`);
   }
 }
 
@@ -339,4 +409,10 @@ if (!apply) log('  预演完成。加 --apply 执行。');
 else {
   log(`  GitHub: ${results.github ?? `https://github.com/${ghLogin}/${REPO}`}`);
   log(`  Gitee : ${results.gitee ?? `https://gitee.com/${gtLogin}/${REPO}`}`);
+  if (failures.length) {
+    log('');
+    for (const f of failures) log(`  ⚠ ${f.platform} 未完成：${f.message}`);
+    log('  （本脚本幂等：网络恢复后重跑即可，已成功的平台不会重复发 release）');
+    process.exitCode = 2;
+  }
 }

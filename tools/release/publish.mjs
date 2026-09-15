@@ -197,19 +197,32 @@ async function ensureGitee(token, login, tag, body) {
  *   ③ 推送后**扫描仓库工作区**里有没有漏出来的凭据文件，有就删掉并大声报错（见 assertNoStrayCreds）。
  */
 async function pushWithTempCreds(remoteUrl, refs, tokens) {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'vmprobe-git-'));
-  // ① 正斜杠路径（Windows 上反斜杠会被 git 当转义符）
-  const credFile = join(tmpDir, '.git-credentials').replace(/\\/g, '/');
-  const lines = [];
-  for (const t of tokens) {
-    if (!t.token) continue;
-    const host = new URL(remoteUrl).host;
-    lines.push(`https://${t.login}:${encodeURIComponent(t.token)}@${host}`);
+  /**
+   * URL 形态决定一切（这里踩过一次 `Invalid URL`）：
+   *   · `https://…`  → 需要临时凭据文件（令牌进 URL 的 userinfo），可选代理；
+   *   · `git@host:…` → SSH，**认证靠密钥**，不该也不需要造凭据文件，
+   *                    代理参数也不适用（`http.proxy` 管不到 ssh）。
+   * 第一版没区分形态，对所有 URL 都 `new URL(remoteUrl).host`，
+   * 于是在 SSH 通道上直接抛 `Invalid URL` —— 而那时 GitHub 恰好只能走 SSH。
+   */
+  const isHttp = /^https?:\/\//i.test(remoteUrl);
+  const tmpDir = isHttp ? mkdtempSync(join(tmpdir(), 'vmprobe-git-')) : null;
+  let credFile = null;
+
+  if (isHttp) {
+    // ① 正斜杠路径（Windows 上反斜杠会被 git 当转义符）
+    credFile = join(tmpDir, '.git-credentials').replace(/\\/g, '/');
+    const lines = [];
+    for (const t of tokens) {
+      if (!t.token) continue;
+      const host = new URL(remoteUrl).host;
+      lines.push(`https://${t.login}:${encodeURIComponent(t.token)}@${host}`);
+    }
+    if (!lines.length) throw new Error('pushWithTempCreds：没有任何可用令牌');
+    writeFileSync(credFile, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+    // ② 断言文件在预期位置（否则就是转义又出问题了，绝不能继续）
+    if (!existsSync(credFile)) throw new Error(`临时凭据文件未落在预期位置：${credFile}`);
   }
-  if (!lines.length) throw new Error('pushWithTempCreds：没有任何可用令牌');
-  writeFileSync(credFile, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
-  // ② 断言文件在预期位置（否则就是转义又出问题了，绝不能继续）
-  if (!existsSync(credFile)) throw new Error(`临时凭据文件未落在预期位置：${credFile}`);
 
   /**
    * 代理支持。
@@ -222,8 +235,8 @@ async function pushWithTempCreds(remoteUrl, refs, tokens) {
    */
   const proxyArgs = [];
   const explicitProxy = process.env.VMPROBE_GIT_PROXY;
-  let proxy = explicitProxy ?? null;
-  if (!proxy) {
+  let proxy = isHttp ? (explicitProxy ?? null) : null;   // SSH 不吃 http.proxy，别加
+  if (isHttp && !proxy) {
     for (const port of [7890, 7891]) {
       try {
         execFileSync('node', [
@@ -250,7 +263,7 @@ async function pushWithTempCreds(remoteUrl, refs, tokens) {
     for (let i = 1; i <= attempts; i += 1) {
       try {
         execFileSync('git', [
-          '-c', `credential.helper=store --file=${credFile}`,
+          ...(credFile ? ['-c', `credential.helper=store --file=${credFile}`] : []),
           ...proxyArgs,
           'push', remoteUrl, ...refs,
         ], { cwd: ROOT, stdio: 'inherit' });
@@ -273,7 +286,7 @@ async function pushWithTempCreds(remoteUrl, refs, tokens) {
       + '  本脚本是幂等的：重跑不会重复建仓、不会重复发 release。',
     );
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });   // SSH 通道没有临时目录
     // ③ 兜底扫描：任何漏进工作区的凭据文件都要立刻消失并报警
     assertNoStrayCreds();
   }

@@ -20,3 +20,6 @@ node_modules/
 *.key
 # 发布脚本的临时凭据文件若被路径转义写歪，会落在工作区里 —— 再多一道防线
 *git-credentials*
+# 提交信息临时文件（曾两次被 git add -A 带走，这次连名字一起挡住）
+msg*.txt
+*git-credentials*

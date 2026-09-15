@@ -26,6 +26,34 @@ import { fileURLToPath } from 'node:url';
 import { githubLogin, giteeLogin, readTokens } from './verify-tokens.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/**
+ * 选推送通道（本机踩过，见 `tools/release/diagnose-github-push.mjs`）：
+ *
+ *   github.com:443   TCP 通但 **TLS 被重置**（"Empty reply from server"）→ HTTPS 推送必失败
+ *   github.com:22    ✔ 通且 SSH 公钥认证成功 → **首选**
+ *   api.github.com   ✔ 通（但写接口会偶发 500）→ 最后手段
+ *
+ * 所以顺序是：**SSH（若认证可用）→ HTTPS（若可用）→ 明确报错并给出 API 通道命令**。
+ * 探测结果决定用哪条，不靠用户手动切换。
+ */
+function sshGitUrl(login) {
+  return `git@github.com:${login}/${REPO}.git`;
+}
+
+function sshAuthWorks() {
+  const target = process.env.VMPROBE_SSH_TEST_HOST ?? 'git@github.com';
+  try {
+    // GitHub 认证成功时输出 "Hi <user>!" 且退出码为 1（不提供 shell），因此**不能只看退出码**
+    const res = execFileSync('ssh', [
+      '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-T', target,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000 });
+    return /Hi [^!]+!/.test(res);
+  } catch (err) {
+    return /Hi [^!]+!/.test(String(err.stdout ?? '')) || /Hi [^!]+!/.test(String(err.stderr ?? ''));
+  }
+}
+
 const apply = process.argv.includes('--apply');
 /**
  * `--skip-push`：只发 release，不做 git 推送。
@@ -122,7 +150,7 @@ async function ensureGithub(token, login, tag, body) {
     throw new Error(`查询 GitHub 仓库失败：HTTP ${head.status}`);
   }
 
-  log(`  GitHub remote = https://github.com/${login}/${REPO}.git`);
+  log(`  GitHub 仓库已就绪：${login}/${REPO}（推送通道在下面单独报告）`);
   if (!apply) { log('  （预演：跳过推送与 release 创建）'); return { pushed: false }; }
   return { pushed: true };
 }
@@ -370,8 +398,30 @@ const results = { github: null, gitee: null };
 /** 各平台的失败原因（一个平台不通**不该**让另一个也不发）。 */
 const failures = [];
 
+/**
+ * 选 GitHub 的推送通道：**优先 SSH**。
+ *
+ * 本机实测（`diagnose-github-push.mjs`）：`github.com:443` TCP 能连但 TLS 被重置，
+ * HTTPS 推送必失败；`github.com:22` 正常且公钥认证通过。因此这里先探 SSH，
+ * 通了就用 SSH —— 这才是"把问题解决掉"，而不是每次靠重试碰运气。
+ */
+let ghChannel = 'HTTPS';
+let ghPushUrl = ghLogin ? `https://github.com/${ghLogin}/${REPO}.git` : null;
 if (ghLogin) {
-  step('GitHub');
+  if (sshAuthWorks()) {
+    ghChannel = 'SSH（github.com:22 认证通过）';
+    ghPushUrl = sshGitUrl(ghLogin);
+  } else if (process.env.VMPROBE_GIT_PROXY) {
+    ghChannel = `HTTPS + 代理 ${process.env.VMPROBE_GIT_PROXY}`;
+  } else {
+    ghChannel = 'HTTPS（⚠ SSH 认证不可用；若 github.com:443 被干扰会失败，'
+      + '可改用 tools/release/push-via-api.mjs）';
+  }
+  log(`  GitHub 推送通道：${ghChannel}`);
+}
+
+if (ghLogin) {
+  step(`GitHub（通道：${ghChannel}）`);
   try {
     await ensureGithub(githubToken, ghLogin, tag, body);
     if (apply) {
@@ -379,7 +429,7 @@ if (ghLogin) {
         log('  （--skip-push：跳过 git 推送，只处理 release）');
       } else {
         await pushWithTempCreds(
-          `https://github.com/${ghLogin}/${REPO}.git`,
+          ghPushUrl,
           ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
           [{ login: ghLogin, token: githubToken }],
         );

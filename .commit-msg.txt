@@ -1,0 +1,23 @@
+解决 GitHub 推不上去：查明是链路干扰，改用 SSH 并让脚本自动选通道
+
+根因（有实测证据，不是猜）：github.com:443 TCP 连得上但 TLS 被重置
+（curl 报 Empty reply from server），所以 HTTPS 推送必失败；同网段的
+api.github.com / codeload / ssh.github.com 都正常，github.com:22 也正常，
+SSH 公钥认证成功。DNS 正常、hosts 无条目、无系统代理 —— 不是本机配置问题。
+
+处置：
+1. 生成专用 ed25519 密钥并登记到 GitHub（令牌有 admin:public_key），
+   写 ~/.ssh/config 固定身份，留 gh-443 别名作备用通道；SSH 主机密钥指纹
+   与 GitHub 官方公布值逐字符一致（无中间人）。
+2. publish.mjs 自动选通道：先探 SSH 认证 → 否则 HTTPS（可配代理）→ 再否则提示 API 通道。
+3. 强制推送原始历史覆盖 API 通道造的提交（两者 tree 哈希相同，内容逐字节一致），
+   现在本地 / GitHub / Gitee 三者 HEAD 完全一致（0e1cff9）。
+4. 新增 tools/release/diagnose-github-push.mjs：一条命令给出 DNS/端口/SSH/建议，只读且不打印私钥。
+
+排查中修掉的三个脚本缺陷：
+- N20 重试的 sleep 用了 unref 定时器 → 顶层 await 提前退出，重试从未发生
+- N21 一个平台失败会中断整个脚本 → Gitee 明明能推也被跳过；改为各自 try/catch
+- N22 tag 映射偷懒 → GitHub 的 v0.3.0 一度指向错误的提交；改为按映射逐个对齐
+
+另记一次操作事故：ssh-keygen -N '""' 被 PowerShell 当成两个字面引号 → 密钥被加了口令，
+症状是 ssh -vvT 显示 Server accepts key 之后仍 Permission denied（能提供公钥、签名时才失败）。

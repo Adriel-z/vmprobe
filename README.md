@@ -497,6 +497,8 @@ overlay 与已安装 bundle 是否 entry id 冲突、3080 上是否有活实例�
 | 日报一直不生成 | 定时器没排程 / 没有采集能力 | 看 `loads.jsonl` 里有没有 `scheduler.started`；`scheduler.not-started` 说明 timer 服务不可用 |
 | 改了源码但行为没变 | profile 依赖用了 `file:`（版本化拷贝） | 换成 `link:` |
 | 改了源码仍没生效 | 内存里还是旧代码 | 重启 DSH（或用临时实例验证） |
+| **`git push` 到 GitHub 卡住 / `Connection was reset` / `Empty reply from server`** | 本机 `github.com:443` 被连接干扰（TCP 能连、TLS 被重置）；DNS 与 hosts 都正常 | 跑 `node tools/release/diagnose-github-push.mjs` 确认；GitHub 改走 SSH（`git remote set-url origin git@github.com:Adriel-z/vmprobe.git`），发布脚本已自动优先 SSH。只剩 API 可用时用 `tools/release/push-via-api.mjs` |
+| `git push` 报 `fetch first`，但内容明明一样 | 远端历史是用 REST API 通道造的，**内容相同但 commit sha 不同** | 先比 `tree`（`git rev-parse FETCH_HEAD^{tree}` 与 `HEAD^{tree}` 一致即内容相同），确认无误后 `--force` 推送本地原始历史对齐 |
 
 **验证插件加载（不影响正在服务的实例）**：
 
@@ -557,11 +559,28 @@ node tools/lib/dsh-runtime.mjs   # 直接运行可打印 DSH 运行时依赖的�
 
 ```powershell
 node tools/release/verify-tokens.mjs        # 自检：令牌是否可用（只打印账号名，绝不打印令牌）
+node tools/release/diagnose-github-push.mjs # 诊断：DNS / 端口连通性 / SSH 认证 / 该走哪条通道
 node tools/release/publish.mjs              # 预演：查远端状态，不改动
 node tools/release/publish.mjs --apply      # 真正发布：建仓（若无）→ 推 main + tags → 发 release
 node tools/release/publish.mjs --apply --move-tag   # 把 tag 强制挪到当前提交（仅用于发布物有缺陷时）
-node tools/release/verify-published.mjs v0.2.0      # 从两个平台的 API 核对仓库/tag/release/提交
+node tools/release/publish.mjs --apply --skip-push  # 只补发 release（代码已用 API 通道推上去时）
+node tools/release/verify-published.mjs v0.3.0      # 从两个平台的 API 核对仓库/tag/release/提交
 ```
+
+**推送通道是自动选的**（本机踩过真实的连通性问题，见下表）：
+
+| 顺序 | 通道 | 什么时候用 |
+|---|---|---|
+| 1 | **SSH**（`git@github.com:…`） | `ssh -T git@github.com` 认证通过时**首选** —— 本机 `github.com:443` 会被干扰，而 `:22` 正常 |
+| 2 | **HTTPS**（可配 `VMPROBE_GIT_PROXY`） | SSH 不可用、但 HTTPS 能过 TLS 时 |
+| 3 | **REST API**（`push-via-api.mjs`） | 前两条都不通、只剩 `api.github.com` 可用时（Git Data API 逐块复刻提交） |
+
+> ⚠️ **本机实测结论**（`diagnose-github-push.mjs` 可复现）：`github.com:443` **TCP 连得上但 TLS 被重置**
+> （`curl` 报 `Empty reply from server`），所以 `git push` 走 HTTPS 必然失败；同一网段的
+> `api.github.com` / `codeload.github.com` / `ssh.github.com` 都正常，`github.com:22` 也正常。
+> **不是 DNS 污染，也不是本机配置问题**（hosts 无条目、无系统代理、DNS 解析正常），
+> 而是针对该域名 443 端口的连接干扰。因此 GitHub 一律走 SSH；首次使用需把公钥登记到 GitHub
+> （`diagnose-github-push.mjs` 会告诉你缺哪一步，令牌有 `admin:public_key` 时可自动登记）。
 
 四条刻意的设计（都是踩过之后加的）：
 
@@ -569,8 +588,8 @@ node tools/release/verify-published.mjs v0.2.0      # 从两个平台的 API 核
 |---|---|
 | **令牌绝不落盘、不进命令行参数** | 推送时写一个**临时**凭据文件交给 git（`credential.helper=store --file=…`），推完立即删除；远端地址始终不含令牌，`.git/config` 里也不会留下 |
 | **临时凭据路径必须用正斜杠** | git 的配置值里**反斜杠是转义符**：用 `C:\Users\…` 会被吃掉反斜杠变成相对路径，于是 git 把**明文令牌写进了仓库工作区**（实测发生，3 个文件，未被提交，已删除）。现在路径用 `/`，并断言落点 + 推送后扫描工作区，发现即删除并报错 |
-| **双平台幂等** | 重跑发布不能失败：GitHub 的"已存在"是 422、Gitee 是 400，两边都识别为"跳过" |
-| **API 调用带重试** | 首次发布就遇到 `HTTP/2 GOAWAY` 抖动；不重试会留下"仓库建好、代码推上去、release 没发出来"的半成品状态 |
+| **双平台幂等 + 互不阻塞** | 重跑发布不能失败（GitHub 的"已存在"是 422、Gitee 是 400）；且一个平台不通不该让另一个也不发 |
+| **API 调用带重试** | 首次发布就遇到 `HTTP/2 GOAWAY` 抖动；不写重试会留下"仓库建好、代码推上去、release 没发出来"的半成品状态 |
 
 > ⚠️ 发布脚本会创建**公开**仓库。若想改成私有，在平台上改一次即可（脚本只在创建时决定可见性）。
 

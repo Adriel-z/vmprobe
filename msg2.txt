@@ -1,0 +1,14 @@
+发布：新增 GitHub API 备用推送通道 + 发布脚本两处修正
+
+背景：本机 github.com:443（git push 的链路）会被重置（三次重试全部 21 秒超时），
+而 api.github.com 一直可达。两者是不同链路，于是加了一条**走 REST API 的备用通道**。
+
+- 新增 tools/release/push-via-api.mjs：
+  Git Data API（blob → tree → commit → ref）**逐个复刻本地提交**，保留提交消息与父子关系；
+  只做快进（基线不是祖先就拒绝）；二进制用 base64 传输；令牌只进请求头。
+  远端提交本地不存在时（本通道创建的提交就是这种情况）必须用 --base <本地sha> 明确基线 ——
+  这个判断只能由人做，脚本不猜。
+- publish.mjs 新增 --skip-push：代码已用 API 推上去时，只补发 release。
+- 修正 tag 映射：第一版让 tag 一律指向"最后推上去的提交"，导致 GitHub 的 v0.3.0
+  指向了它之后的一个提交，而 Gitee 指向正确提交 —— 两平台同一 tag 指向不同提交，
+  正是跨平台发布最不该出现的不一致。现在建立 本地sha → 远端sha 映射，tag 指向自己那个目标。

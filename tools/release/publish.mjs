@@ -27,6 +27,12 @@ import { githubLogin, giteeLogin, readTokens } from './verify-tokens.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const apply = process.argv.includes('--apply');
+/**
+ * `--skip-push`：只发 release，不做 git 推送。
+ * 用途很具体：当代码已经用 `tools/release/push-via-api.mjs` 推上去、只差 release 时
+ * （本机 github.com:443 会被重置，而 api.github.com 一直可用）。
+ */
+const skipPush = process.argv.includes('--skip-push');
 const REPO = 'vmprobe';
 const DESCRIPTION = 'VMProbe —— 单台云服务器的虚拟机探针：DSH 主控端插件 + Linux 协从端（受控动作 + 审批 + 审计链）';
 
@@ -369,12 +375,16 @@ if (ghLogin) {
   try {
     await ensureGithub(githubToken, ghLogin, tag, body);
     if (apply) {
-      await pushWithTempCreds(
-        `https://github.com/${ghLogin}/${REPO}.git`,
-        ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
-        [{ login: ghLogin, token: githubToken }],
-      );
-      log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
+      if (skipPush) {
+        log('  （--skip-push：跳过 git 推送，只处理 release）');
+      } else {
+        await pushWithTempCreds(
+          `https://github.com/${ghLogin}/${REPO}.git`,
+          ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
+          [{ login: ghLogin, token: githubToken }],
+        );
+        log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
+      }
       results.github = await createGithubRelease(githubToken, ghLogin, tag, body);
     }
   } catch (err) {
@@ -390,12 +400,16 @@ if (gtLogin) {
   try {
     await ensureGitee(giteeToken, gtLogin, tag, body);
     if (apply) {
-      await pushWithTempCreds(
-        `https://gitee.com/${gtLogin}/${REPO}.git`,
-        ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
-        [{ login: gtLogin, token: giteeToken }],
-      );
-      log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
+      if (skipPush) {
+        log('  （--skip-push：跳过 git 推送，只处理 release）');
+      } else {
+        await pushWithTempCreds(
+          `https://gitee.com/${gtLogin}/${REPO}.git`,
+          ['main', ...(moveTag ? [`+refs/tags/${tag}:refs/tags/${tag}`] : ['--tags'])],
+          [{ login: gtLogin, token: giteeToken }],
+        );
+        log(`  已推送 main 与 ${moveTag ? `（强制更新的）tag ${tag}` : 'tags'}`);
+      }
       results.gitee = await createGiteeRelease(giteeToken, gtLogin, tag, body);
     }
   } catch (err) {

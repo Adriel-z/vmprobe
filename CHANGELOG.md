@@ -1,7 +1,76 @@
 # 更新日志
 
-本项目遵循"每个里程碑一个版本"的粗粒度版本号：`0.x.0` 对应一个里程碑。
+本项目遵循"每个里程碑一个版本"的粗粒度版本号：`0.x.0` 对应一个里程碑；
+**发布之后的缺陷修复走补丁号 `0.x.y`**（只修缺陷与补证据，不夹带新功能）。
 每个版本的**证据**（测试项数、真机验证结论）与**缺陷台账**分别见 `DEVELOPMENT.md` 与 `ISSUES.md`。
+
+---
+
+## v0.3.1 —— 修复轮：宿主可用性 / 门禁可信度 / 发布通道（2026-09-16）
+
+v0.3.0 发布后，**真机启动**立刻暴露了一类形态完全相同的缺陷：**一个可选插件的内部错误，
+可以让用户连 Web UI 都打不开**（两次发生，且不是同一处代码）。排查它期间又发现
+**门禁自己没有被验证过**（第一层在这台机器上必然失败），以及发布脚本在本机链路上多处失效。
+本版**只做修复与证据补强，不含新功能**；`v0.3.0` 一节保留发布当时的内容，不追改。
+
+### 修复
+
+- **（第十一轮）`apply()` 抛异常 = 宿主打不开 —— 现在插件绝不把异常交给 loader（fail-safe）。**
+  上一轮修的是"**怎么读**可选服务"（`ctx.get`），这一轮补的是"**万一还是抛了**怎么办"：
+  cordis 里一条 entry 的 `apply()` 抛错 = 那条 entry 失败 = **整棵插件树加载不出来**，
+  DSH Web 把这件事当致命错误（`dsh web` → `exited with code 1`）。
+  也就是说：**宿主里任何一个插件的一行抛错，用户连 Web UI 都打不开**，现场只有一句
+  `plugin tree failed to load`（没有插件名、没有栈）。本项目已被这个形态咬过两次 ——
+  非法 YAML 的 `.credentials.yaml`、以及 I5 落地当天的 `ctx.approval`。
+  现在导出面 `apply()` 是**兜底壳**，真实现是**不导出**的 `applyPlugin()`：
+  异常被 `logger.error` + `process.stderr` + 台账 `apply.failed`（**有 `apply.failed` 而无 `load` = 失败**）
+  留痕后吞掉，宿主照常启动；`config.strict === true` 时**照旧抛出**（开发期要响亮）。
+  边界已写明：**只兜自己**的异常，别人的 entry 抛错照样能让宿主起不来（`DESIGN.md` D17）。
+  验证方式是一次**对照实验**：用 `--patch` 注入同一次"必然失败的加载"
+  （`storageDir` 指到"父路径是文件"→ `mkdirSync` 必抛），`strict: true` 复刻修复前
+  （`plugin tree failed to load` + exit 1），默认则**照常起来并监听端口、HTTP 200**
+  （`ISSUES.md` §17.3）。
+- **（第九轮 · 真机验证）I5 落地缺陷：读未注入的服务名会抛异常，整棵插件树起不来。**
+  `approval` 从 `inject` 里拿掉之后，`apply()` 里那句 `ctx.approval && …` 自己就会崩：
+  cordis 的 ctx 是 Proxy，读"已声明但本 fiber 未注入"的服务名**抛异常**
+  （`cannot get property "approval" without inject`），不是返回 `undefined` ——
+  而 `apply()` 抛错 = 那条 loader entry 失败 = **整棵树加载失败**（用户实测：`dsh web` 直接起不来）。
+  现在所有可选服务一律经新增的 `plugin-host/src/services.js`（`ctx.get(name)`）读取，
+  "加载期永不阻塞 + 执行期 fail-closed"的 I5 意图**现在才真的成立**。
+  同源修掉的还有：`ctx.credentials`（凭据解析路径，尚未引爆）与
+  `systemPrompt.section({id,title,content})` —— 该 API 要的是 `{name, order, text}`，
+  三个字段全错、异常被 try/catch 吞成"宿主不支持"，**基础用法提示从未注入过**。
+- **（第十轮）`npm test` 在 Node 22.22.2 下跑不起来**：`node --test packages/core/test/ …`
+  的目录参数在该版本**不被当作"在这些目录里找测试"**，而是被当成三个入口模块执行 →
+  `Cannot find module '…\packages\core\test'`，`1..3 / pass 0 / fail 3`。
+  于是 `npm run check` 的**第一层在这台机器上必然失败**，"全绿"只能靠人工绕过第一层。
+  改用默认测试发现（`node --test`，收集到的 174 项与改造前同一集合，默认排除 `node_modules`）：
+  实测 `npm test` → **174 / 174 通过**。
+- **发布脚本四轮修复**（第八轮 §14.3 起）：① 重试用的 sleep 挂在 **unref 过的定时器**上，
+  顶层 await 先看到"没有待处理任务"就退出 —— 报 `Detected unsettled top-level await`，
+  **重试一次都没发生**；② 一个平台失败会中断整个脚本（GitHub 挂了明明能推的 Gitee 也被跳过），
+  改为两端各自 try/catch、最后汇总并以 exit code 2 结束；③ tag 映射偷懒指向"最后推上去的提交"，
+  导致同一 tag 在两平台指向不同提交，改为**本地 sha → 远端 sha 映射**；
+  ④ **推送通道自动探测**（SSH `github.com:22` 优先，HTTPS+代理次之，API 通道兜底）+
+  新增 `tools/release/diagnose-github-push.mjs` 一条命令给结论；⑤ SSH 通道曾被当成 HTTPS
+  去造临时凭据文件 → `Invalid URL`，现在按 URL 形态分流。另有两处仓库卫生：
+  提交信息临时文件两次被 `git add -A` 带入库，`.gitignore` 连名字一起挡住。
+
+### 测试
+
+- **第十一轮补强（fail-safe 的回归门禁）**：契约检查新增 `[12]` 一节，四条断言 ——
+  内部加载失败时 `apply()` **不抛**、必须留下台账 `apply.failed`、
+  失败**不得冒充成功**（台账里不许出现 `load`）、失败时**不留半套工具**；
+  另有"`strict: true` 时照旧抛"以保证开发期不会被兜底掩盖。
+  单跑只能证明"现在能起来"，**对照实验才证明"是兜底救了它"** —— 这条纪律已写进 `ISSUES.md` 的防线清单。
+- **第九轮补强（插件契约检查）**：新增两类探测点 ——
+  ① 模拟 cordis 代理语义（未注入的服务名**必须抛**），② 用 DSH 自带的**真实 cordis**
+  起一棵最小插件树（兄弟 fiber 提供 `approval`/`tools`，VMProbe 未注入它们）并断言加载成功。
+  之所以必须补：I5 提交时八层检查**全绿**，因为契约检查用的 ctx 是裸对象，
+  读不存在的字段只得到 `undefined`，正好把当时的错误假设"验证"了一遍（`ISSUES.md` §15.3）。
+- `npm run check` 的第一层修好后，八层在本机**首次做到一次跑通**：单测 **174 / 174**、
+  故障推演 21 项、SSH 端到端 27 项、插件契约（含新增 `[12]`）、归档 12 项、文档引用、
+  环境预检、协从端 8 项，全部通过。
 
 ---
 
@@ -34,63 +103,28 @@
   安全属性没有变弱（没有审批就绝不执行特权且不可逆的动作），验证方式加强为
   "断言 `transport.apply` **一次都没被调用**"。
   ⚠️ 这一条在发布时**有落地缺陷**（只改了"要不要注入"、没改"怎么读"），当天真机启动即失败；
-  修正见下方「修复」第一条与 `ISSUES.md` §15。
+  修正见 **v0.3.1**「修复」第二条与 `ISSUES.md` §15。
 
 ### 修复
 
-- **（第十一轮）`apply()` 抛异常 = 宿主打不开 —— 现在插件绝不把异常交给 loader（fail-safe）。**
-  上一轮修的是"**怎么读**可选服务"（`ctx.get`），这一轮补的是"**万一还是抛了**怎么办"：
-  cordis 里一条 entry 的 `apply()` 抛错 = 那条 entry 失败 = **整棵插件树加载不出来**，
-  DSH Web 把这件事当致命错误（`dsh web` → `exited with code 1`）。
-  也就是说：**宿主里任何一个插件的一行抛错，用户连 Web UI 都打不开**，现场只有一句
-  `plugin tree failed to load`（没有插件名、没有栈）。本项目已被这个形态咬过两次 ——
-  非法 YAML 的 `.credentials.yaml`、以及 I5 落地当天的 `ctx.approval`。
-  现在导出面 `apply()` 是**兜底壳**，真实现是**不导出**的 `applyPlugin()`：
-  异常被 `logger.error` + `process.stderr` + 台账 `apply.failed`（**有 `apply.failed` 而无 `load` = 失败**）
-  留痕后吞掉，宿主照常启动；`config.strict === true` 时**照旧抛出**（开发期要响亮）。
-  边界已写明：**只兜自己**的异常，别人的 entry 抛错照样能让宿主起不来（`DESIGN.md` D17）。
-  验证方式是一次**对照实验**：用 `--patch` 注入同一次"必然失败的加载"
-  （`storageDir` 指到"父路径是文件"→ `mkdirSync` 必抛），`strict: true` 复刻修复前
-  （`plugin tree failed to load` + exit 1），默认则**照常起来并监听端口、HTTP 200**
-  （`ISSUES.md` §17.3）。
-- **（第九轮 · 真机验证）I5 落地缺陷：读未注入的服务名会抛异常，整棵插件树起不来。**
-  `approval` 从 `inject` 里拿掉之后，`apply()` 里那句 `ctx.approval && …` 自己就会崩：
-  cordis 的 ctx 是 Proxy，读"已声明但本 fiber 未注入"的服务名**抛异常**
-  （`cannot get property "approval" without inject`），不是返回 `undefined` ——
-  而 `apply()` 抛错 = 那条 loader entry 失败 = **整棵树加载失败**（用户实测：`dsh web` 直接起不来）。
-  现在所有可选服务一律经新增的 `plugin-host/src/services.js`（`ctx.get(name)`）读取，
-  "加载期永不阻塞 + 执行期 fail-closed"的 I5 意图**现在才真的成立**。
-  同源修掉的还有：`ctx.credentials`（凭据解析路径，尚未引爆）与
-  `systemPrompt.section({id,title,content})` —— 该 API 要的是 `{name, order, text}`，
-  三个字段全错、异常被 try/catch 吞成"宿主不支持"，**基础用法提示从未注入过**。
 - **归档 schema 版本号解析取错段**：`schema.split('/')[1]` 取到的是 `archive` 而非版本号（→ `NaN`），
   于是"版本太新"被误报成"没有迁移路径" —— 结论虽然仍是否决，但**理由说错了**，
   而理由正是运维的判断依据（"去升级主控端" vs "格式不认识"）。
 - **`maxRunLogBytes` 缺默认值 → 运行日志每次写入都轮转**（`size <= undefined` 恒为 false），
   症状是"运行日志永远只有一行"，极具迷惑性。已补默认值并加专门的回归测试。
-- **（第十轮）`npm test` 在 Node 22.22.2 下跑不起来**：`node --test packages/core/test/ …`
-  的目录参数在该版本**不被当作"在这些目录里找测试"**，而是被当成三个入口模块执行 →
-  `Cannot find module '…\packages\core\test'`，`1..3 / pass 0 / fail 3`。
-  于是 `npm run check` 的**第一层在这台机器上必然失败**，"全绿"只能靠人工绕过第一层。
-  改用默认测试发现（`node --test`，收集到的 174 项与改造前同一集合，默认排除 `node_modules`）：
-  实测 `npm test` → **174 / 174 通过**。
+
+> ⚠️ 本版**发布之后**真机启动又暴露了三处缺陷（I5 落地当天的 `ctx.approval`、
+> 门禁第一层在本机必然失败、`apply()` 不该把异常交给 loader），
+> 以及发布脚本在本机链路上的四处失效 —— 全部**归入 `v0.3.1`**，此处不追改。
 
 ### 测试
 
 单元测试 **143 → 174 项**；新增 `npm run check:archive`（12 项，含外部解压交叉验证）。
-`npm run check` 现在有**八层**（单测 / 插件契约 / 故障推演 / SSH 端到端 / 归档 / 文档 / 预检 / 协从端），全绿。
+`npm run check` 现在有**八层**（单测 / 插件契约 / 故障推演 / SSH 端到端 / 归档 / 文档 / 预检 / 协从端）全绿。
 
-**第九轮补强（插件契约检查）**：新增两类探测点 ——
-① 模拟 cordis 代理语义（未注入的服务名**必须抛**），② 用 DSH 自带的**真实 cordis**
-起一棵最小插件树（兄弟 fiber 提供 `approval`/`tools`，VMProbe 未注入它们）并断言加载成功。
-之所以必须补：I5 提交时八层检查**全绿**，因为契约检查用的 ctx 是裸对象，
-读不存在的字段只得到 `undefined`，正好把当时的错误假设"验证"了一遍（`ISSUES.md` §15.3）。
-
-**第十一轮补强（fail-safe 的回归门禁）**：契约检查新增 `[12]` 一节，四条断言 ——
-内部加载失败时 `apply()` **不抛**、必须留下台账 `apply.failed`、
-失败**不得冒充成功**（台账里不许出现 `load`）、失败时**不留半套工具**；
-另有"`strict: true` 时照旧抛"以保证开发期不会被兜底掩盖。
-单跑只能证明"现在能起来"，**对照实验才证明"是兜底救了它"** —— 这条纪律已写进 `ISSUES.md` 的防线清单。
+> ⚠️ 这里的"全绿"在**本机**直到 `v0.3.1` 才成立：第一层的目录参数在 Node 22.22.2 下
+> 不被当作测试发现，`npm run check` 必然停在第一层（`ISSUES.md` §16）。
+> 第九轮 / 第十一轮的门禁补强（真实 cordis 加载检查、fail-safe 对照实验）也都在 `v0.3.1`。
 
 ### 未做（明确说明，不假装）
 

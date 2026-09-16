@@ -1,7 +1,7 @@
 {
   "name": "vmprobe",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "VMProbe — 单台云服务器探针（主控端 DSH 插件 + Linux 协从端）",
   "type": "module",
   "engines": {

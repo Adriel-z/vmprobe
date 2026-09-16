@@ -568,8 +568,12 @@ node tools/release/publish.mjs              # 预演：查远端状态，不改�
 node tools/release/publish.mjs --apply      # 真正发布：建仓（若无）→ 推 main + tags → 发 release
 node tools/release/publish.mjs --apply --move-tag   # 把 tag 强制挪到当前提交（仅用于发布物有缺陷时）
 node tools/release/publish.mjs --apply --skip-push  # 只补发 release（代码已用 API 通道推上去时）
-node tools/release/verify-published.mjs v0.3.0      # 从两个平台的 API 核对仓库/tag/release/提交
+node tools/release/verify-published.mjs v0.3.1      # 从两个平台的 API 核对仓库/tag/release/提交
 ```
+
+> 版本号取自 `package.json`（`--tag` 可显式覆盖），tag 名与 release 正文都跟着它走 ——
+> 所以顺序是**先改版本号与 `CHANGELOG.md` 里对应的 `## vX.Y.Z` 小节，再跑 `--apply`**；
+> 脚本对"tag/release 已存在"是幂等跳过，因此**发布物有缺陷时不会自动更新**已有 release 的正文。
 
 **推送通道是自动选的**（本机踩过真实的连通性问题，见下表）：
 

@@ -496,6 +496,8 @@ overlay 与已安装 bundle 是否 entry id 冲突、3080 上是否有活实例�
 | 报 `ERR_UNSUPPORTED_DIR_IMPORT` | `name` 指向的是目录 | 指向**入口文件**（`…/src/index.js`）或改用包名 |
 | 报 `cannot get property "approval" without inject`（`plugin tree failed to load` 的内层原因） | 插件**直接读**了一个没放进 `inject` 的可选服务。cordis 的 ctx 是 Proxy：读未注入的服务名**抛异常**，不是返回 `undefined` | 已在 I6 修复（一律经 `ctx.get(name)` 读，见 `plugin-host/src/services.js` 与 DEVELOPMENT §5.2 坑 18）。若你改过这块代码，注意别写回 `ctx.approval` |
 | 工具没出现 | 插件没加载 | 看 `loads.jsonl` 有没有 `event:"load"`；没有就是**没加载**（而不是工具注册失败） |
+| **DSH 能起来，但 6 个 vmprobe 工具一个都没有** | 插件**内部**加载失败被 fail-safe 拦下了（I7）：宿主照常启动，本插件这一轮被跳过 | 看 `loads.jsonl`：有 `apply.failed` 而没有 `load`，`reason` 就是原因；web.log 里也有同一句。修掉原因后重启 DSH 即可 —— **不需要**为了恢复去动 profile |
+| 想确认"fail-safe 真的在生效" | —— | 用 `--patch` 注入一次必然失败的加载（`storageDir` 指向"父路径是文件"的位置），对比 `strict: true`（复刻修复前：`plugin tree failed to load` + exit 1）与默认（照常起来）—— 做法见 `ISSUES.md` §17.3 |
 | 日报一直不生成 | 定时器没排程 / 没有采集能力 | 看 `loads.jsonl` 里有没有 `scheduler.started`；`scheduler.not-started` 说明 timer 服务不可用 |
 | 改了源码但行为没变 | profile 依赖用了 `file:`（版本化拷贝） | 换成 `link:` |
 | 改了源码仍没生效 | 内存里还是旧代码 | 重启 DSH（或用临时实例验证） |

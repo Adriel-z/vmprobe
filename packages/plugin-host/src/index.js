@@ -67,11 +67,15 @@ export const inject = ['tools'];
 export const DEFAULT_STORAGE_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'vmprobe');
 
 /**
- * 插件入口。
+ * 插件的真正实现（**不要直接导出它**）。
+ *
+ * 导出面是下面那个 fail-safe 的 `apply()`；这里抛出的任何异常都会被它拦下并变成
+ * 一条 `apply.failed` 台账，而不是让整棵插件树加载失败。
+ *
  * @param {object} ctx CORDIS 上下文
  * @param {object} [config] cordis.patch.yml 里的 config
  */
-export function apply(ctx, config = {}) {
+function applyPlugin(ctx, config = {}) {
   const storageDir = config.storageDir ?? DEFAULT_STORAGE_DIR;
 
   // ---- 凭据访问：**按操作现取**，且延迟到调用时才碰服务 ----
@@ -384,6 +388,114 @@ export function apply(ctx, config = {}) {
 
   // 注意：**不返回 engine**。CORDIS 会把 apply 的返回值当作 disposer 处理，
   // 返回对象有被误判的风险。需要 engine 时经 ctx 服务或调试钩子暴露（M1 处理）。
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  apply() 兜底：**绝不把异常交给 loader**（I7 决策，第十轮真机复盘）
+//
+//  ── 为什么 ───────────────────────────────────────────────────────────────────
+//
+//  cordis 的规则是"一条 entry 的 apply 抛异常 = 那条 entry 失败 = **整棵插件树加载不出来**"，
+//  而 DSH Web 的启动路径把"插件树加载失败"直接当成致命错误（`dsh web` → `exited with code 1`）。
+//  也就是说：**宿主里任何一个插件的任何一行抛错，用户连 Web UI 都打不开** —— 界面上没有
+//  插件名、没有栈，只有一句 "plugin tree failed to load"。这个代价与"VMProbe 是可选能力"
+//  这件事完全不相称。
+//
+//  本项目已经因此被咬过两次（都不是同一处代码）：
+//    · `~/.dsh/.credentials.yaml` 里两行中文标注 + 全角冒号 → 该文件不是合法 YAML →
+//      credentials 那条 entry 的 apply 抛错 → DSH 起不来；
+//    · I5 落地时 `ctx.approval`（cordis 的 Proxy 语义）在 apply 里抛错 → DSH 起不来。
+//  第二次修完之后想清楚：**"我的 bug 不该有让宿主打不开的权力"**，于是加上这一层。
+//
+//  ── 代价与对策（必须说清楚，否则就是"静默失败"）──────────────────────────────
+//
+//  吞掉异常意味着"插件没起来"这件事有可能只留在日志里。对策是**四重留痕**：
+//    ① `ctx.logger.error`（DSH 会把它带进 web.log / 终端）；
+//    ② `process.stderr` —— `ctx.logger` 的输出不一定进文件（见上面台账那段的实测注释）；
+//    ③ 加载台账 `apply.failed`（`~/.dsh/vmprobe/loads.jsonl`）—— 排查"插件到底起了没有"
+//       的第一手证据，`load` 事件缺席 + `apply.failed` 在场 = 一眼可辨；
+//    ④ 失败原因里带上建议（去哪个文件、看哪一节）。
+//
+//  ── 开发期不要被它掩盖 ─────────────────────────────────────────────────────
+//
+//  `config.strict === true` 时**照旧抛出**（契约检查/真机调试用这个开关），
+//  默认才是 fail-safe —— 生产要"活着"，开发要"响亮"。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 插件入口（DSH/cordis 调用这个）。
+ *
+ * 语义：默认**永不抛异常**（内部真实现见 `applyPlugin()`）；
+ * 只有 `config.strict === true` 时才照旧抛出 —— 那是给契约检查/真机调试用的开关。
+ *
+ * @param {object} ctx CORDIS 上下文
+ * @param {object} [config] cordis.patch.yml 里的 config（`strict: true` 可关掉 fail-safe）
+ */
+export function apply(ctx, config = {}) {
+  try {
+    applyPlugin(ctx, config);
+  } catch (err) {
+    // 先留痕再决定抛不抛：strict 模式下"响亮"不等于"可以把原因丢掉"
+    reportApplyFailure(ctx, config, err);
+    if (config?.strict === true) throw err;
+  }
+  // 刻意**不返回任何值**：cordis 会把 apply 的返回值当 disposer 处理（见 applyPlugin 末尾）。
+}
+
+/**
+ * 记下"apply 失败"这件事。**自身也必须永不抛异常** —— 它已经是最后一道防线，
+ * 再抛就等于兜底失效。
+ *
+ * 与 `applyPlugin` 里的 `ledger()` 是同一目标文件、同一格式，但这里刻意不复用那个闭包：
+ * 失败可能发生在闭包建好**之前**（例如 `createEngine` 的 mkdir 就抛了），
+ * 那时闭包与 engine 都不存在。代价是重复十几行，换来的是"任何时刻都能留痕"。
+ */
+function reportApplyFailure(ctx, config, err) {
+  const reason = err?.message ?? String(err);
+  const hint =
+    '插件已 fail-safe 跳过（DSH 与其它插件不受影响），但 VMProbe 工具本轮不可用。'
+    + '排查：~/.dsh/vmprobe/loads.jsonl 里应有一条 apply.failed；'
+    + `源码见 packages/plugin-host/src/index.js（DESIGN.md D17 / ISSUES.md §17）。`;
+
+  try {
+    ctx?.logger?.error?.(`vmprobe: 加载失败 —— ${reason}。${hint}`);
+  } catch {
+    /* logger 本身不可用也不能影响兜底 */
+  }
+  try {
+    // 有些 profile 的 logger 只接 warn/info（error 不存在），补一条 warn 保证可见
+    ctx?.logger?.warn?.(`vmprobe: 加载失败（fail-safe 已生效）—— ${reason}`);
+  } catch {
+    /* 同上 */
+  }
+  try {
+    // stderr 是最后一道对外通道：web.log 收的是子进程的 stdout/stderr
+    process.stderr.write(`vmprobe: 加载失败（fail-safe 已生效，插件树继续加载）—— ${reason}\n`);
+  } catch {
+    /* 同上 */
+  }
+  try {
+    const storageDir = config?.storageDir ?? DEFAULT_STORAGE_DIR;
+    const markerTarget = config?.loadMarkerFile === false
+      ? null
+      : (typeof config?.loadMarkerFile === 'string'
+        ? config.loadMarkerFile
+        : join(storageDir, 'loads.jsonl'));
+    if (markerTarget) {
+      appendFileSync(markerTarget, `${JSON.stringify({
+        ts: new Date().toISOString(),
+        pid: process.pid,
+        plugin: name,
+        event: 'apply.failed',
+        reason,
+        // 只留头几行栈：台账是给人 grep 的，不是转储文件
+        stack: typeof err?.stack === 'string' ? err.stack.split('\n').slice(0, 4).join(' | ') : null,
+        strict: config?.strict === true,
+      })}\n`, 'utf8');
+    }
+  } catch {
+    /* 台账写不进去（例如目录就是失败原因）也不能再抛 */
+  }
 }
 
 /** 供外部（文档/测试/CLI）引用的用法提示常量。 */

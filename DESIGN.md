@@ -496,6 +496,31 @@ ssh <target>  "sh -s -- --check"   ← stdin = bootstrap.sh 的内容
 
 ---
 
+### D17 —— 插件**加载失败**不该等于**宿主打不开**：`apply()` 的 fail-safe（I7 决策）
+
+cordis 的规则是"一条 entry 的 `apply()` 抛异常 = 那条 entry 失败 = **整棵插件树加载不出来**"，
+而 DSH Web 把"插件树加载失败"当致命错误（`dsh web` → `exited with code 1`）。
+于是：**任何一个插件的一行抛错，用户连 Web UI 都打不开** —— 界面上只有一句
+`plugin tree failed to load`，既没有插件名也没有栈。本项目已被这个形态咬过两次
+（非法 YAML 的 `.credentials.yaml`、I5 落地当天的 `ctx.approval`）。
+
+这个代价与"VMProbe 在宿主里只是一个**可选能力**"完全不相称，所以：
+
+| | 形态 | 内部异常时 |
+|---|---|---|
+| 之前 | 插件导出的 `apply()` 本身就是实现 | 那条 entry 失败 → **整棵树加载不出来 → DSH 起不来** |
+| 现在 | 导出的是兜底壳 `apply()`，真实现在**不导出**的 `applyPlugin()` | 异常被拦下并留痕，**宿主照常启动** |
+
+- **兜底 ≠ 静默**：四处留痕 —— `logger.error`、`process.stderr`（`ctx.logger` 不一定进文件，
+  见 `DEVELOPMENT.md` §5.2 坑 8）、台账 `apply.failed`（**有 `apply.failed` 而无 `load` = 失败**），
+  以及失败原因里直接写排查指引。
+- **开发期要响亮**：`config.strict === true` 时照旧抛出（契约检查与真机演练用这个开关）。
+- **边界（不许含糊）**：这只保护**本插件自己**的异常。别人的 entry 抛错照样能让宿主起不来 ——
+  那是宿主的设计，不是本插件能兜的；因此 `DEVELOPMENT.md` §5.2 坑 20 记下了"用 overlay 注入一次
+  加载失败、跑两次 `dsh web` 做对照"的验证方法。
+
+---
+
 ## 4. 连接与保活模型
 
 ### 4.1 连接状态机

@@ -38,6 +38,21 @@
 
 ### 修复
 
+- **（第十一轮）`apply()` 抛异常 = 宿主打不开 —— 现在插件绝不把异常交给 loader（fail-safe）。**
+  上一轮修的是"**怎么读**可选服务"（`ctx.get`），这一轮补的是"**万一还是抛了**怎么办"：
+  cordis 里一条 entry 的 `apply()` 抛错 = 那条 entry 失败 = **整棵插件树加载不出来**，
+  DSH Web 把这件事当致命错误（`dsh web` → `exited with code 1`）。
+  也就是说：**宿主里任何一个插件的一行抛错，用户连 Web UI 都打不开**，现场只有一句
+  `plugin tree failed to load`（没有插件名、没有栈）。本项目已被这个形态咬过两次 ——
+  非法 YAML 的 `.credentials.yaml`、以及 I5 落地当天的 `ctx.approval`。
+  现在导出面 `apply()` 是**兜底壳**，真实现是**不导出**的 `applyPlugin()`：
+  异常被 `logger.error` + `process.stderr` + 台账 `apply.failed`（**有 `apply.failed` 而无 `load` = 失败**）
+  留痕后吞掉，宿主照常启动；`config.strict === true` 时**照旧抛出**（开发期要响亮）。
+  边界已写明：**只兜自己**的异常，别人的 entry 抛错照样能让宿主起不来（`DESIGN.md` D17）。
+  验证方式是一次**对照实验**：用 `--patch` 注入同一次"必然失败的加载"
+  （`storageDir` 指到"父路径是文件"→ `mkdirSync` 必抛），`strict: true` 复刻修复前
+  （`plugin tree failed to load` + exit 1），默认则**照常起来并监听端口、HTTP 200**
+  （`ISSUES.md` §17.3）。
 - **（第九轮 · 真机验证）I5 落地缺陷：读未注入的服务名会抛异常，整棵插件树起不来。**
   `approval` 从 `inject` 里拿掉之后，`apply()` 里那句 `ctx.approval && …` 自己就会崩：
   cordis 的 ctx 是 Proxy，读"已声明但本 fiber 未注入"的服务名**抛异常**
@@ -70,6 +85,12 @@
 起一棵最小插件树（兄弟 fiber 提供 `approval`/`tools`，VMProbe 未注入它们）并断言加载成功。
 之所以必须补：I5 提交时八层检查**全绿**，因为契约检查用的 ctx 是裸对象，
 读不存在的字段只得到 `undefined`，正好把当时的错误假设"验证"了一遍（`ISSUES.md` §15.3）。
+
+**第十一轮补强（fail-safe 的回归门禁）**：契约检查新增 `[12]` 一节，四条断言 ——
+内部加载失败时 `apply()` **不抛**、必须留下台账 `apply.failed`、
+失败**不得冒充成功**（台账里不许出现 `load`）、失败时**不留半套工具**；
+另有"`strict: true` 时照旧抛"以保证开发期不会被兜底掩盖。
+单跑只能证明"现在能起来"，**对照实验才证明"是兜底救了它"** —— 这条纪律已写进 `ISSUES.md` 的防线清单。
 
 ### 未做（明确说明，不假装）
 

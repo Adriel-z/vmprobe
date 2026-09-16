@@ -9,7 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -660,6 +660,112 @@ if (!cordis?.Context || typeof cordis.Service !== 'function') {
       assert.equal(approvalReqs.length, 1, `应发起 1 次审批，实际 ${approvalReqs.length}`);
       assert.equal(r3?.status, 'blocked', `审批后仍应由 echoHostname 护栏阻断，实际 ${r3?.status}`);
       assert.equal(applyCalls.n, 0, '被阻断时一行都不该执行');
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// ===========================================================================
+// [12] I7：apply() **永不抛** —— 一条 entry 抛异常 = **整棵插件树加载失败** = DSH 起不来。
+//
+// 这一节守的不是"某处代码对不对"，而是"**我的 bug 能不能把宿主弄死**"。
+// 真机已经因此被咬过两次：(a) `.credentials.yaml` 不是合法 YAML（中文标注 + 全角冒号）；
+// (b) 本插件 I5 落地时的 `ctx.approval`。两次的表现完全一样：web.log 里
+// `plugin tree failed to load` + `exited with code 1`，浏览器里什么都打不开。
+//
+// 所以断言的不是"某函数不抛"，而是 **`mod.apply()` 这个对外入口在内部炸掉时也不抛**，
+// 且必须留下可追的证据（台账 apply.failed），不能被当成"加载成功"。
+// ===========================================================================
+console.log('\n[12] I7：apply() 绝不把异常交给 loader（fail-safe）');
+
+{
+  const dir = await mkdtemp(join(tmpdir(), 'vmprobe-failsafe-'));
+  const ledgerFile = join(dir, 'loads.jsonl');
+
+  /**
+   * 造一个**必然失败**的加载条件：storageDir 的父路径是个**文件**。
+   * 选它是因为失败点在 `createEngine` 的第一行（`mkdirSync(join(dir,'logs'), {recursive:true})`），
+   * 也就是 apply() 的很早期 —— 这正是"闭包/engine 都还不存在"的最坏情况，
+   * 台账兜底必须在这种时刻也能写出来。
+   */
+  const blocker = join(dir, 'blocker');
+  writeFileSync(blocker, 'not a directory', 'utf8');
+  const brokenStorage = join(blocker, 'sub');
+
+  const newCtx = () => {
+    const registered = [];
+    const logs = [];
+    return {
+      registered,
+      logs,
+      ctx: {
+        tools: { register(def) { registered.push(def); return () => {}; } },
+        logger: {
+          info: (m) => logs.push(['info', m]),
+          warn: (m) => logs.push(['warn', m]),
+          error: (m) => logs.push(['error', m]),
+        },
+        get: () => undefined,
+        inject: () => {},
+      },
+    };
+  };
+
+  try {
+    check('探测点有效：这个 storageDir 确实会让加载失败（否则下面全是空转）', () => {
+      assert.throws(() => mkdirSync(join(brokenStorage, 'logs'), { recursive: true }));
+    });
+
+    const a = newCtx();
+    let applyError = null;
+    try {
+      mod.apply(a.ctx, {
+        storageDir: brokenStorage,
+        transport: null,
+        dailyReport: false,
+        loadMarkerFile: ledgerFile,
+      });
+    } catch (err) {
+      applyError = err;
+    }
+
+    check('★ 内部加载失败时 apply() 不抛（真机上这里会让整棵树加载不出来）', () => {
+      assert.equal(applyError, null, `apply 抛了：${applyError?.message}`);
+    });
+    check('★ 失败被记成台账 apply.failed（不是静默变成"加载成功"）', () => {
+      const ledger = readFileSync(ledgerFile, 'utf8');
+      const line = ledger.split('\n').find((l) => l.includes('"apply.failed"'));
+      assert.ok(line, `台账里没有 apply.failed：${ledger.trim().split('\n').slice(-3).join(' | ')}`);
+      assert.ok(JSON.parse(line).reason, 'apply.failed 必须带 reason');
+    });
+    check('★ 台账里**没有** load 事件（不能让"半加载"冒充成功）', () => {
+      const ledger = readFileSync(ledgerFile, 'utf8');
+      assert.ok(!ledger.includes('"event":"load"'), '失败路径不该出现 load');
+    });
+    check('失败经 logger.error 说出来（不靠"工具莫名消失"让人猜）', () => {
+      const [level, msg] = a.logs.find(([lv]) => lv === 'error') ?? [];
+      assert.equal(level, 'error', `实际日志：${JSON.stringify(a.logs)}`);
+      assert.match(msg, /加载失败/);
+    });
+    check('失败时不留半套工具（registered 为空，避免"看起来能用"）', () => {
+      assert.equal(a.registered.length, 0, `实际注册 ${a.registered.length} 个`);
+    });
+
+    // ---- 开发期开关：strict:true 时照旧抛，别让兜底把 bug 藏起来 ----
+    const b = newCtx();
+    check('★ `strict: true` 时 apply() 照旧抛（开发/契约检查必须响亮）', () => {
+      assert.throws(() => mod.apply(b.ctx, {
+        storageDir: brokenStorage,
+        transport: null,
+        dailyReport: false,
+        loadMarkerFile: join(dir, 'loads-strict.jsonl'),
+        strict: true,
+      }));
+    });
+    check('strict 抛错的同时也留下了台账（失败原因不丢）', () => {
+      const ledger = readFileSync(join(dir, 'loads-strict.jsonl'), 'utf8');
+      assert.match(ledger, /apply\.failed/);
     });
   } finally {
     await rm(dir, { recursive: true, force: true });

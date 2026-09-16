@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test packages/core/test/ packages/transport/test/ packages/plugin-host/test/",
+    "test": "node --test",
     "check": "npm run test && npm run check:plugin && npm run check:faults && npm run check:ssh && npm run check:archive && npm run check:docs && npm run check:doctor && npm run check:agent",
     "check:plugin": "node tools/checks/verify-plugin.mjs",
     "check:faults": "node tools/checks/simulate-faults.mjs",

@@ -53,6 +53,12 @@
   而理由正是运维的判断依据（"去升级主控端" vs "格式不认识"）。
 - **`maxRunLogBytes` 缺默认值 → 运行日志每次写入都轮转**（`size <= undefined` 恒为 false），
   症状是"运行日志永远只有一行"，极具迷惑性。已补默认值并加专门的回归测试。
+- **（第十轮）`npm test` 在 Node 22.22.2 下跑不起来**：`node --test packages/core/test/ …`
+  的目录参数在该版本**不被当作"在这些目录里找测试"**，而是被当成三个入口模块执行 →
+  `Cannot find module '…\packages\core\test'`，`1..3 / pass 0 / fail 3`。
+  于是 `npm run check` 的**第一层在这台机器上必然失败**，"全绿"只能靠人工绕过第一层。
+  改用默认测试发现（`node --test`，收集到的 174 项与改造前同一集合，默认排除 `node_modules`）：
+  实测 `npm test` → **174 / 174 通过**。
 
 ### 测试
 

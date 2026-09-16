@@ -403,5 +403,268 @@ console.log('\n[7] I5：缺少审批服务时的加载与执行行为');
   }
 }
 
+// ===========================================================================
+// [9] I6：cordis 的上下文是 **Proxy** —— 读一个"已声明但未注入"的服务名会**抛异常**，
+//      而不是返回 undefined。
+//
+// 这一节守的是"插件还起不起得来"：I5 把 approval 从 inject 里拿掉之后，apply() 里那句
+// `ctx.approval &&` 自己就把整棵插件树带崩了（真机实测：
+// `cannot get property "approval" without inject` → 整棵树加载失败）。
+//
+// 为什么 [7] 查不出来：它的 ctx 是**裸对象**，读不存在的字段只会得到 undefined ——
+// 那正是我当时的假设。**用自己写的桩去验证假设，等于没验证**（§5.2 坑 14）。
+// 所以这里造一个"像 cordis 那样说话"的 ctx：未注入的服务名一读就抛。
+// ===========================================================================
+console.log('\n[9] I6：模拟 cordis 代理语义（未注入的服务名会抛异常）');
+
+{
+  const dir = await mkdtemp(join(tmpdir(), 'vmprobe-proxy-'));
+  const registered = [];
+  const logs = [];
+  const approvalRequests = [];
+  const promptSections = [];
+  const applyCalls = { n: 0 };
+
+  /** 组合里**有**审批服务（web profile 的实际情况：dsh-base 里有 dsh-user-approval）。 */
+  const provided = {
+    approval: { async request(req) { approvalRequests.push(req); return 'allowed-once'; } },
+    // 记录 prompt section 的注册参数 —— 用来守住"签名猜错了也没人发现"这类静默失效
+    systemPrompt: { section(s) { promptSections.push(s); return () => {}; } },
+  };
+
+  /**
+   * 假传输层：只为让"计划新鲜度"过关 —— 这样 R3 才会真的走到审批那一关。
+   * 缺了它，R3 会停在 `stale`，断言"被拒绝"照样绿，但拒绝的原因不是审批（坑：断言了错的东西）。
+   */
+  const proxyTransport = {
+    async state() { return 'connected'; },
+    async check() {
+      return { probed: true, pubkeyAuth: true, passwordAuth: true, port: 22, serviceKeyInstalled: false };
+    },
+    async apply() { applyCalls.n += 1; return { exit: 0 }; },
+    async heartbeat() { return { ok: true, at: new Date().toISOString(), latencyMs: 1 }; },
+  };
+
+  const proxyCtx = {
+    tools: { register(def) { registered.push(def); return () => {}; } },
+    logger: { info: (m) => logs.push(['info', m]), warn: (m) => logs.push(['warn', m]) },
+    // cordis 的正式读取入口：无注入要求，未提供即 undefined
+    get: (name) => provided[name],
+    inject: () => {},
+  };
+  // 复刻 cordis 的行为：**已声明但本 fiber 未注入**的服务名，一读就抛
+  const UNINJECTED = ['approval', 'credentials', 'timer'];
+  for (const name of UNINJECTED) {
+    Object.defineProperty(proxyCtx, name, {
+      get() { throw new Error(`cannot get property "${name}" without inject`); },
+      configurable: true,
+    });
+  }
+
+  try {
+    // 先确认这个桩确实复刻了触发条件 —— 否则下面全是空转
+    check('探测点有效：旧写法 `ctx.approval` 在这个 ctx 上会抛（这正是 I5 崩溃的原因）', () => {
+      assert.throws(() => proxyCtx.approval, /without inject/);
+    });
+
+    let loadError = null;
+    try {
+      mod.apply(proxyCtx, {
+        storageDir: dir,
+        transport: proxyTransport,
+        dailyReport: false,
+        loadMarkerFile: join(dir, 'loads.jsonl'),
+      });
+    } catch (err) {
+      loadError = err;
+    }
+
+    check('★ 该类上下文下 apply() 不抛错（I5 落地时就是在这里把整棵树带崩的）', () => {
+      assert.equal(loadError, null, `apply 抛错了：${loadError?.message}`);
+    });
+    check('★ 工具照样全部注册', () => {
+      assert.equal(registered.length, 6, `应注册 6 个工具，实际 ${registered.length}`);
+    });
+    check('审批服务**能通过 get 拿到**时如实记为可用（不误报不可用）', () => {
+      const ledger = readFileSync(join(dir, 'loads.jsonl'), 'utf8');
+      assert.ok(ledger.includes('"approval.available"'), '台账里应有 approval.available 事件');
+      assert.ok(!ledger.includes('"approval.unavailable"'), '不该同时记 unavailable');
+    });
+    // 宿主对 section() 的要求（dsh-system-prompt/lib/types/index.d.ts:47 的 PromptSection）：
+    // name 字符串 + order **有限数** + text 字符串或函数。非有限 order 直接抛 TypeError。
+    // 此前写的是 { id, title, content } —— 三个字段全错，异常被 try/catch 吞成"不可用"告警，
+    // 表现就像"宿主不支持"。这类"签名猜错"必须由探测点守住。
+    check('★ systemPrompt.section 的注册参数形状正确（name / order / text）', () => {
+      assert.equal(promptSections.length, 1, `应注册 1 个 prompt section，实际 ${promptSections.length}`);
+      const s = promptSections[0];
+      assert.equal(typeof s?.name, 'string', 'name 必须是字符串');
+      assert.ok(Number.isFinite(s?.order), `order 必须是有限数，实际 ${JSON.stringify(s?.order)}`);
+      assert.ok(
+        typeof s?.text === 'string' || typeof s?.text === 'function',
+        'text 必须是字符串或函数',
+      );
+    });
+
+    const statusTool = registered.find((d) => d.name === 'vmprobe_status');
+    const targetsTool = registered.find((d) => d.name === 'vmprobe_targets');
+    const actionTool = registered.find((d) => d.name === 'vmprobe_action');
+    const execCtx = { callId: 'c-i6', signal: new AbortController().signal, arguments: {}, agent: { sessionId: 's-i6' } };
+
+    // 加目标会走 credentialState → 读 credentials（这里它是"未注入即抛"的）
+    const added = await targetsTool.execute(
+      { op: 'add', id: 't_i6', hostname: '10.0.0.10', user: 'ops', authRef: 'VMPROBE_I6_PASSWORD' },
+      execCtx,
+    ).catch((err) => ({ threw: err }));
+    check('★ credentials 不可用时**不抛异常**，而是如实说"凭据状态未知"', () => {
+      assert.ok(!added?.threw, `不应抛异常：${added?.threw?.message}`);
+      const st = added?.target?.credential ?? added?.credential ?? null;
+      if (st) assert.equal(st.known, false, '取不到凭据服务时必须是 known:false，不能假装知道');
+    });
+
+    const status = await statusTool.execute({}, execCtx);
+    check('状态工具报告"审批可用"（与真机一致）', () => {
+      assert.equal(status.approvalAvailable, true);
+      assert.ok(
+        !status.warnings.some((w) => /审批服务/.test(w)),
+        `审批可用时不该有审批警告：${JSON.stringify(status.warnings)}`,
+      );
+    });
+
+    // R3：审批可用 → 应当**真的发起一次审批**，然后被 echoHostname 护栏挡在执行之前
+    const r3 = await actionTool.execute({ target: 't_i6', action: 'ssh.passwordless.enable' }, execCtx);
+    check('★ R3 经新读取路径真的发起了审批（走通了 approval 这一关）', () => {
+      assert.equal(approvalRequests.length, 1, `应发起 1 次审批，实际 ${approvalRequests.length}`);
+      assert.match(String(approvalRequests[0]?.reason ?? ''), /R3/, '审批理由应点明风险级');
+    });
+    check('★ "审批通过"≠"可以执行"：即使用户批准，未实现的确认环节仍阻断', () => {
+      assert.equal(r3?.status, 'blocked', `应被阻断，实际 status=${r3?.status}`);
+      assert.equal(applyCalls.n, 0, `被阻断时一行都不该执行，实际执行了 ${applyCalls.n} 次`);
+    });
+
+    console.log('\n[10] 该类上下文下的插件日志');
+    for (const [level, msg] of logs) console.log(`  [${level}] ${msg}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// ===========================================================================
+// [11] 真实 cordis 运行时 —— "真机那一步"的本地替身
+//
+// 为什么 [9] 还不够：[9] 的桩**是我写的**，用自己写的桩去验证自己对宿主语义的理解，
+// 等于没验证（§5.2 坑 14）。这一节直接拿 DSH 自带的 cordis 起一棵最小插件树：
+// 服务由**兄弟** fiber 提供（复刻"approval 在 dsh-base 里、VMProbe 没注入它"的现场），
+// 而 VMProbe 就是第三个兄弟 —— 崩与不崩，这次是真的由宿主的 Proxy 决定的。
+//
+// 这一段可以在沙箱里跑；**真机启动**（`dsh --profile web --no-open --port 0`）仍有独立价值
+// ——它验证的是 Loader 组装与 profile 组合，本脚本代替不了（§5.2 坑 1）。
+// ===========================================================================
+console.log('\n[11] 真实 cordis：兄弟 entry 提供服务、VMProbe 未注入它');
+
+const cordis = await tryImportDshPackage('@deepseek-ai/cordis');
+
+if (!cordis?.Context || typeof cordis.Service !== 'function') {
+  console.log('  ⚠ 取不到 DSH 自带的 cordis —— 本节**跳过**（跳过不等于通过）');
+} else {
+  const dir = await mkdtemp(join(tmpdir(), 'vmprobe-cordis-'));
+  const registeredTools = [];
+  const approvalReqs = [];
+  const applyCalls = { n: 0 };
+
+  /** 复刻 dsh-user-approval：一个以 `approval` 之名提供服务的**兄弟** fiber。 */
+  class ApprovalStub extends cordis.Service {
+    constructor(ctx) { super(ctx, 'approval'); }
+    async request(req) { approvalReqs.push(req); return 'allowed-once'; }
+  }
+  /** 复刻 dsh-tools：VMProbe 的 `inject: ['tools']` 是必需依赖，得有人提供。 */
+  class ToolsStub extends cordis.Service {
+    constructor(ctx) { super(ctx, 'tools'); }
+    register(def) { registeredTools.push(def); return () => {}; }
+  }
+
+  const transport = {
+    async state() { return 'connected'; },
+    async check() {
+      return { probed: true, pubkeyAuth: true, passwordAuth: true, port: 22, serviceKeyInstalled: false };
+    },
+    async apply() { applyCalls.n += 1; return { exit: 0 }; },
+    async heartbeat() { return { ok: true, at: new Date().toISOString(), latencyMs: 1 }; },
+  };
+
+  try {
+    const app = new cordis.Context();
+
+    // ① 兄弟 entry：服务提供方
+    await app.plugin({ name: 'approval-entry', apply: (c) => { c.plugin(ApprovalStub); } }, {});
+    await app.plugin({ name: 'tools-entry', apply: (c) => { c.plugin(ToolsStub); } }, {});
+
+    // ② 兄弟 entry：只做两件事 —— 证明"直接读会抛"，并证明"经 get 能拿到"
+    let directAccessError = null;
+    let viaGet = null;
+    await app.plugin({
+      name: 'sibling-probe',
+      apply(c) {
+        try { void c.approval; } catch (err) { directAccessError = err; }
+        viaGet = c.get('approval');
+      },
+    }, {});
+
+    check('★ 真实 cordis 下，兄弟 fiber 里读 `ctx.approval` 确实会抛（与真机报错同源）', () => {
+      assert.ok(directAccessError, '本该抛异常，却没有 —— 那说明本节的复刻不成立');
+      assert.match(directAccessError.message, /without inject/);
+    });
+    check('★ 真实 cordis 下，`ctx.get("approval")` 能拿到兄弟提供的那份服务', () => {
+      assert.equal(typeof viaGet?.request, 'function', 'get 应能读到兄弟 entry 提供的 approval');
+    });
+
+    // ③ 兄弟 entry：VMProbe 自己（inject: ['tools']）
+    let loadError = null;
+    try {
+      await app.plugin(mod, {
+        storageDir: dir,
+        transport,
+        dailyReport: false,
+        loadMarkerFile: join(dir, 'loads.jsonl'),
+      });
+    } catch (err) {
+      loadError = err;
+    }
+
+    check('★ 真实 cordis 下 VMProbe 能加载（I5 落地时这里会让整棵树起不来）', () => {
+      assert.equal(loadError, null, `加载抛错了：${loadError?.message}`);
+    });
+    check('★ 真实 cordis 下 6 个工具全部注册', () => {
+      assert.equal(registeredTools.length, 6, `实际 ${registeredTools.length}`);
+    });
+    check('真实 cordis 下台账记 approval.available（读到了兄弟 entry 的审批服务）', () => {
+      const ledger = readFileSync(join(dir, 'loads.jsonl'), 'utf8');
+      assert.ok(ledger.includes('"approval.available"'), `台账：${ledger.trim().split('\n').slice(-3).join(' | ')}`);
+    });
+
+    // ④ 执行侧：审批真的经真实服务发起了
+    const actionTool = registeredTools.find((d) => d.name === 'vmprobe_action');
+    const targetsTool = registeredTools.find((d) => d.name === 'vmprobe_targets');
+    const statusTool = registeredTools.find((d) => d.name === 'vmprobe_status');
+    const execCtx = { callId: 'c-cordis', signal: new AbortController().signal, arguments: {}, agent: { sessionId: 's-cordis' } };
+
+    await targetsTool.execute(
+      { op: 'add', id: 't_cordis', hostname: '10.0.0.11', user: 'ops', authRef: 'VMPROBE_CORDIS_PASSWORD' },
+      execCtx,
+    );
+    const status = await statusTool.execute({}, execCtx);
+    check('真实 cordis 下状态工具报告"审批可用"', () => {
+      assert.equal(status.approvalAvailable, true);
+    });
+    const r3 = await actionTool.execute({ target: 't_cordis', action: 'ssh.passwordless.enable' }, execCtx);
+    check('★ 真实 cordis 下 R3 的发起的审批确实到达了兄弟 entry 的服务', () => {
+      assert.equal(approvalReqs.length, 1, `应发起 1 次审批，实际 ${approvalReqs.length}`);
+      assert.equal(r3?.status, 'blocked', `审批后仍应由 echoHostname 护栏阻断，实际 ${r3?.status}`);
+      assert.equal(applyCalls.n, 0, '被阻断时一行都不该执行');
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 console.log(`\n${failures === 0 ? '全部通过 ✔' : `失败 ${failures} 项 ✖`}\n`);
 process.exit(failures === 0 ? 0 : 1);

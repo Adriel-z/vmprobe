@@ -33,9 +33,21 @@
   **R2/R3 一律拒绝**，并在日志 / 加载台账 / `vmprobe_status` 三处显示"审批服务不可用"。
   安全属性没有变弱（没有审批就绝不执行特权且不可逆的动作），验证方式加强为
   "断言 `transport.apply` **一次都没被调用**"。
+  ⚠️ 这一条在发布时**有落地缺陷**（只改了"要不要注入"、没改"怎么读"），当天真机启动即失败；
+  修正见下方「修复」第一条与 `ISSUES.md` §15。
 
 ### 修复
 
+- **（第九轮 · 真机验证）I5 落地缺陷：读未注入的服务名会抛异常，整棵插件树起不来。**
+  `approval` 从 `inject` 里拿掉之后，`apply()` 里那句 `ctx.approval && …` 自己就会崩：
+  cordis 的 ctx 是 Proxy，读"已声明但本 fiber 未注入"的服务名**抛异常**
+  （`cannot get property "approval" without inject`），不是返回 `undefined` ——
+  而 `apply()` 抛错 = 那条 loader entry 失败 = **整棵树加载失败**（用户实测：`dsh web` 直接起不来）。
+  现在所有可选服务一律经新增的 `plugin-host/src/services.js`（`ctx.get(name)`）读取，
+  "加载期永不阻塞 + 执行期 fail-closed"的 I5 意图**现在才真的成立**。
+  同源修掉的还有：`ctx.credentials`（凭据解析路径，尚未引爆）与
+  `systemPrompt.section({id,title,content})` —— 该 API 要的是 `{name, order, text}`，
+  三个字段全错、异常被 try/catch 吞成"宿主不支持"，**基础用法提示从未注入过**。
 - **归档 schema 版本号解析取错段**：`schema.split('/')[1]` 取到的是 `archive` 而非版本号（→ `NaN`），
   于是"版本太新"被误报成"没有迁移路径" —— 结论虽然仍是否决，但**理由说错了**，
   而理由正是运维的判断依据（"去升级主控端" vs "格式不认识"）。
@@ -46,6 +58,12 @@
 
 单元测试 **143 → 174 项**；新增 `npm run check:archive`（12 项，含外部解压交叉验证）。
 `npm run check` 现在有**八层**（单测 / 插件契约 / 故障推演 / SSH 端到端 / 归档 / 文档 / 预检 / 协从端），全绿。
+
+**第九轮补强（插件契约检查）**：新增两类探测点 ——
+① 模拟 cordis 代理语义（未注入的服务名**必须抛**），② 用 DSH 自带的**真实 cordis**
+起一棵最小插件树（兄弟 fiber 提供 `approval`/`tools`，VMProbe 未注入它们）并断言加载成功。
+之所以必须补：I5 提交时八层检查**全绿**，因为契约检查用的 ctx 是裸对象，
+读不存在的字段只得到 `undefined`，正好把当时的错误假设"验证"了一遍（`ISSUES.md` §15.3）。
 
 ### 未做（明确说明，不假装）
 

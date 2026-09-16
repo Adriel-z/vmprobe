@@ -236,7 +236,8 @@ sh bootstrap.sh --uninstall --purge
 | 「把日志导出来」 | `vmprobe_logs`：审计事件（已脱敏） |
 
 **基础用法提示是双路落地的**：`vmprobe_catalog` 返回完整用法（按需拉取，不占常驻 token）；
-另有极简的一段尝试注入 `ctx.systemPrompt`（该 API 签名未经核实，不可用时只记警告、不假装成功）。
+另有极简的一段注入 `systemPrompt` section（签名已核实：`{ name, order, text }`；
+服务不可用时只记警告、不假装成功）。
 
 ### 5.2 六个工具
 
@@ -359,7 +360,7 @@ node -e "import('./packages/plugin-host/src/engine.js').then(async m => { const 
 
 | 文件 | 内容 |
 |---|---|
-| `<storageDir>/loads.jsonl` | **加载台账**：`load` / `config.effective` / `config.warning` / `scheduler.started` / `heartbeat.started` 等。排查"插件到底加载了没有"的第一手证据 |
+| `<storageDir>/loads.jsonl` | **加载台账**：`load` / `config.effective` / `config.warning` / `approval.available` / `approval.unavailable` / `scheduler.started` / `heartbeat.started` 等。排查"插件到底加载了没有"的第一手证据 |
 | `<storageDir>/logs/audit.jsonl` | **命令使用日志**：逐条 exec 的哈希链（含 `prev` / `hash`）。**过统一脱敏后才落盘** |
 | `<storageDir>/logs/audit.NNNN.jsonl` | 按大小（默认 8 MiB）轮转出来的历史文件。**跨文件链可校验**（轮转记录接续旧尾哈希） |
 | `<storageDir>/runs/<runId>.log` | **运行记录**（M2）：单次执行的完整输出 —— 计划摘要、逐条命令、退出码、stdout/stderr、**校验结论**。默认上限 4 MiB（`maxRunBytes`），超出截断并标注 |
@@ -493,6 +494,7 @@ overlay 与已安装 bundle 是否 entry id 冲突、3080 上是否有活实例�
 | 报 `duplicate loader entry id: vmprobe-host` | 插件已作为 bundle 装入 profile，你又用了 `--patch tools/overlay.yml`（同 id） | 已安装时**不要**用 overlay；开发循环改为"改源码 + 起临时实例" |
 | 报 `Received protocol 'c:'` | `name` 用了裸 Windows 绝对路径 | 改成 `file:///C:/...` URL |
 | 报 `ERR_UNSUPPORTED_DIR_IMPORT` | `name` 指向的是目录 | 指向**入口文件**（`…/src/index.js`）或改用包名 |
+| 报 `cannot get property "approval" without inject`（`plugin tree failed to load` 的内层原因） | 插件**直接读**了一个没放进 `inject` 的可选服务。cordis 的 ctx 是 Proxy：读未注入的服务名**抛异常**，不是返回 `undefined` | 已在 I6 修复（一律经 `ctx.get(name)` 读，见 `plugin-host/src/services.js` 与 DEVELOPMENT §5.2 坑 18）。若你改过这块代码，注意别写回 `ctx.approval` |
 | 工具没出现 | 插件没加载 | 看 `loads.jsonl` 有没有 `event:"load"`；没有就是**没加载**（而不是工具注册失败） |
 | 日报一直不生成 | 定时器没排程 / 没有采集能力 | 看 `loads.jsonl` 里有没有 `scheduler.started`；`scheduler.not-started` 说明 timer 服务不可用 |
 | 改了源码但行为没变 | profile 依赖用了 `file:`（版本化拷贝） | 换成 `link:` |

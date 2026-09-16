@@ -78,8 +78,9 @@ tools/*                      （只读地检查上面这些，不参与运行时
 | **`transport/src/keys.js`** | 130 | OpenSSH 密钥编码（公钥行 + 私钥容器 + 指纹），**自研**（ssh2 不接受 PKCS8 ed25519） | `generateKeypair` `opensshPublicKeyLine` `opensshPrivateKeyFile` `publicKeyFingerprint` |
 | **`transport/src/ssh.js`** | 560 | SSH 会话管理：连接复用、keepalive、主机密钥三态校验、exec（含 argv 引用与 idempotent 超时）、stdin/文件投递、`verifyKeyLogin` / `verifyPasswordLogin` | `createSshTransport` `shQuote` `buildCommand` `HostKey*Error` |
 | **`transport/src/passwordless.js`** | 300 | 免密登录事务（启用 + 撤销），**核心不变式：任何时刻至少一条可用连接路径** | `enablePasswordless` `disablePasswordless` `PasswordlessError` |
-| `plugin-host/src/index.js` | 250 | DSH 插件入口：`name`/`inject`/`apply` + 凭据适配 + 传输层装配 + controllerHandlers + 加载台账 + 定时器 | `name` `inject` `apply` `DEFAULT_STORAGE_DIR` `DEFAULT_AGENT_SCRIPT` |
-| `plugin-host/src/tools.js` | 640 | 6 个 `ToolDefinition`、统一错误脱敏出口、凭据状态查询（只看"是否已配置"） | `createTools` `USAGE_HINT` |
+| `plugin-host/src/index.js` | 390 | DSH 插件入口：`name`/`inject`/`apply` + 凭据适配 + 传输层装配 + controllerHandlers + 加载台账 + 定时器 | `name` `inject` `apply` `DEFAULT_STORAGE_DIR` `DEFAULT_AGENT_SCRIPT` |
+| **`plugin-host/src/services.js`** | 78 | **可选服务的唯一读取入口**（`ctx.get` 而非 `ctx.approval`；I6） | `optionalService` `resolveApproval` `approvalAvailable` `resolveCredentials` |
+| `plugin-host/src/tools.js` | 775 | 6 个 `ToolDefinition`、统一错误脱敏出口、凭据状态查询（只看"是否已配置"） | `createTools` `USAGE_HINT` |
 | `plugin-host/src/engine.js` | 700 | 引擎：目标 / 计划 / 执行分发 / 审计落盘与轮转 / 报告盖章 / 新鲜度校验 / facts 落盘 / 指纹固定 / 认证切换 | `createEngine` `PlanStaleError` `NotImplementedError` |
 | `plugin-host/src/scheduler.js` | 113 | 每日报告调度器（tick + 幂等 + 单飞） | `startDailyReportScheduler` `normalizeAtUtc` |
 | `plugin-host/cordis.patch.yml` | — | 包自带的挂载声明（`dsh.bundle` 指向它） | — |
@@ -87,7 +88,7 @@ tools/*                      （只读地检查上面这些，不参与运行时
 | `tools/doctor.mjs` | — | 离线预检（凭据 / overlay / bundles 一致性 / id 冲突 / 活实例） | — |
 | `tools/fix-credentials.mjs` | — | 凭据 YAML 修复（备份 + 逐值 sha256 保真 + 原子替换） | — |
 | `tools/vmprobe-cred.mjs` | — | **凭据录入**（不回显 + 二次确认 + 原子写；从不输出任何值） | — |
-| `tools/checks/*` | — | 六项检查：契约 / 推演 / **SSH 端到端** / 转义 / 安装守卫 / 文档一致性（+ bash 定位器） | — |
+| `tools/checks/*` | — | 六项检查：契约（含**真实 cordis 加载**）/ 推演 / **SSH 端到端** / 转义 / 安装守卫 / 文档一致性（+ bash 定位器） | — |
 
 ---
 
@@ -199,9 +200,10 @@ DSH 启动
 ```js
 // ① 函数插件契约（来源：dsh-tool-todo/README.md）
 export const name = 'vmprobe'
-export const inject = ['tools', 'approval']      // 必需服务；缺失 → 插件加载失败
-export function apply(ctx, config = {}) { }      // 同步即可（不要依赖 await 异步 apply）
+export const inject = ['tools']                  // **只放"缺了就什么也做不了"的服务**
+// ★ approval / credentials / systemPrompt / timer **都不在这里** —— 可选服务缺失不该让整棵树失败
 // ★ 绝不能有 default 导出 —— Loader 的 unwrapExports 会折叠模块并丢掉 inject
+export function apply(ctx, config = {}) { }      // 同步即可（不要依赖 await 异步 apply）
 
 // ② 工具注册（来源：dsh-tools/lib/types/index.d.ts:603）
 ctx.tools.register(definition: ToolDefinition): () => void
@@ -226,7 +228,8 @@ ctx.tools.register(definition: ToolDefinition): () => void
 
 // ⑤ 审批（来源：dsh-user-approval/lib/types/index.d.ts:104-125）
 //     只有五个字段，**没有承载富文本的通道** —— 所以富计划必须走工具结果 + presentCall
-ctx.approval.request({ agent, toolName, callId?, reason?, signal? })
+const approval = ctx.get('approval')             // ★ 不是 ctx.approval！见 ⑧
+approval?.request({ agent, toolName, callId?, reason?, signal? })
   → Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'>
 // ★ 只有 allowed-once 是授予；缺失/抛异常的应答器返回 unavailable → 必须 fail-closed
 // ★ 要求当前有**打开的回合**：空闲时发起会被拒 → 定时任务无法申请审批（只能做 R0/R1）
@@ -239,9 +242,19 @@ ctx.approval.request({ agent, toolName, callId?, reason?, signal? })
 
 // ⑦ 可选依赖的动态注入（来源：cordis registry.d.ts:111）
 ctx.inject(['timer'], (childCtx) => { … })   // 依赖就绪时执行；缺失则永不执行，**不阻塞插件加载**
+
+// ⑧ **读可选服务**（来源：cordis reflect.ts 的 `get` 文档 + DSH 自己的用法）
+ctx.get('approval')        // → 服务实例，或 undefined（无注入要求）
+ctx.approval               // ✖ 不要这么写：服务"已声明但本 fiber 未注入"时**抛异常**
+                           //   `Error: cannot get property "approval" without inject`
+// ★ 为什么：cordis 的 ctx 是 Proxy，只有"把名字放进 inject"的 fiber 才会把服务快照进
+//   fiber.store（Fiber.store 的注释原话：*snapshot of **required** service implementations*）。
+//   DSH 自己一律用 ctx.get：dsh-tools 的 serviceAsk、dsh-tool-bash / -fs / -pwsh、
+//   dsh-subagent、dsh-host-apiproxy 都是这个写法。
+// ★ 本项目的收敛点：`plugin-host/src/services.js`（optionalService / approvalAvailable / resolveCredentials）
 ```
 
-### 5.2 十七个实测出来的坑（每条都真的踩过）
+### 5.2 十九个实测出来的坑（每条都真的踩过）
 
 | # | 坑 | 现象 / 修法 |
 |---|---|---|
@@ -262,6 +275,8 @@ ctx.inject(['timer'], (childCtx) => { … })   // 依赖就绪时执行；缺失
 | 15 | **同一个概念有两个"形状"，混用不会立刻报错** | `harnessTarget()` 产出的是**已完成规范化**的目标（`authRef: {kind, ref}`），而 `engine.addTarget()` 要的是**扁平输入**（`authRef: '引用名'`）。两者混用时 `makeTarget` 把 ref 又包了一层 —— 在"忽略参数"的凭据解析器下**照样能连上**，直到某个严格解析器才炸，报错还是"凭据 `[object Object]` 尚未配置"。**规则**：边界上提供两个**名字不同**的构造器（`harnessTarget` / `harnessTargetInput`），并且让 `makeTarget` 直接拒绝对象型 `authRef` |
 | 16 | **`timeoutMs: null` 会让整棵插件树加载失败** | `tools.register` 的校验是"定义了就必须是正有限数"：`null !== undefined` → 抛 `TypeError`。当时我正打算用一个 getter 返回 `null` 表示"暂时不声明"—— 那等价于**把 N4 那类致命错误再写一遍**。**规则**：可选字段要么**不出现**（`undefined`），要么是合法值；别用 `null` 表达"没有" |
 | 17 | **可选字段"缺失"与"显式为 null"是两种语义** | 校验结论 `satisfied` 一开始在"探测未实现"分支里**整个不返回**，于是调用方拿到 `undefined`。契约上它只有 `true/false/null` 三态，**字段必须永远存在** —— 缺字段会诱使别人写 `if (verify.satisfied)`，把"未判定"当成"否"或"是" |
+| 18 | **可选服务不能"直接读"—— cordis 的 ctx 是 Proxy，读未注入的服务名会抛异常** | I5 决策（把 `approval` 从 inject 里拿掉）**落地当天就把 DSH 弄成起不来了**：`apply()` 里那句 `ctx.approval && …` 抛 `cannot get property "approval" without inject` → 那条 entry 失败 → **整棵树加载失败**。写成 `undefined` 心理模型（JS 习惯）在这里是错的：只有 `inject` 里的服务才会被快照进 `fiber.store`。**修法**：一律经 `ctx.get(name)` 读（DSH 自己就这么写），本项目收敛在 `plugin-host/src/services.js`。**更重要的教训**：当时的六项检查全绿 —— 因为它们用的 ctx 是**裸对象**，读不存在的字段只会得到 `undefined`，正好把错误假设"验证"了一遍。现在契约检查里有真实 cordis 起的最小插件树（兄弟 entry 提供服务、VMProbe 未注入），以及"旧写法必须抛"的探测点 |
+| 19 | **`systemPrompt.section()` 的签名也只能靠读类型，别靠猜** | 原来写的是 `{ id, title, content }` —— 而 `PromptSection`（dsh-system-prompt/lib/types/index.d.ts:47）要的是 `{ name, order, text }`，且 `order` 非有限数直接抛 `TypeError`。三个字段**全错**，异常被本段 `try/catch` 吞成一条"宿主不支持"的告警 → 提示**从未注入**过，而日志看起来像环境问题。**修法**：按类型改对；契约检查里加了"注册参数形状"断言 |
 
 **另外两条部署要点**：
 
@@ -514,8 +529,8 @@ npm run check          # 全套
 
 | 层 | 命令 | 性质 |
 |---|---|---|
-| 单元测试 | `npm run test` | 纯逻辑，**174 项**（core 132 + transport 9 + plugin-host 33），毫秒级 |
-| 插件契约 | `npm run check:plugin` | mock ctx 上跑 `apply()`；**并用 DSH 自己的 schema 校验器验 `output.schema`/`parameters` 子集**（不用启动就能拦住"整棵树加载失败"这类错） |
+| 单元测试 | `npm run test` | 纯逻辑，**174 项**（core 140 + transport 9 + plugin-host 25），毫秒级 |
+| 插件契约 | `npm run check:plugin` | mock ctx 上跑 `apply()`；**并用 DSH 自己的 schema 校验器验 `output.schema`/`parameters` 子集**（不用启动就能拦住"整棵树加载失败"这类错）；**并用 DSH 自带的真实 cordis 起一棵最小插件树**（兄弟 entry 提供服务、VMProbe 未注入）—— 专门守住"可选服务怎么读"这类只有真机才会炸的错 |
 | 故障推演 | `npm run check:faults` | 21 个探测点，用假传输层走真实执行路径 |
 | **SSH 端到端** | `npm run check:ssh` | **真实 ssh2 服务端** + Git bash 作为远端 shell：握手/认证/主机密钥/exec/stdin/文件/超时 + 免密事务（含失败回滚）+ 心跳三态（成功/干净断开/静默死亡）+ **M2 的 verify 四情形与取消贯通**（27 项） |
 | **归档** | `npm run check:archive` | 导出 → **外部实现交叉验证**（PowerShell `Expand-Archive`）→ 导入干净目录逐文件比对 → 私钥加密与错误口令（12 项） |

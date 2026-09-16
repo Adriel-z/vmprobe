@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createEngine } from './engine.js';
 import { createTools, USAGE_HINT } from './tools.js';
+import { approvalAvailable, optionalService, resolveCredentials } from './services.js';
 import { startDailyReportScheduler, startTransportHeartbeat } from './scheduler.js';
 import { createSshTransport } from '../../transport/src/ssh.js';
 import { enablePasswordless, disablePasswordless } from '../../transport/src/passwordless.js';
@@ -53,6 +54,11 @@ export const name = 'vmprobe';
  *       - 加载台账与 `vmprobe_status` 都会显示"审批服务不可用"，**不静默**。
  * 安全属性没有变弱（没有审批就绝不执行特权且不可逆的动作），但消除了"缺服务即整棵树失败"的隐患。
  *
+ * ⚠️ **I6 补丁（第九轮真机验证）**：I5 只改了"要不要 inject"，漏了"怎么读"。
+ * cordis 读一个未注入的服务名会**抛异常**（不是返回 undefined），于是 apply() 里那句
+ * `ctx.approval &&` 本身就把整棵树带崩了（`cannot get property "approval" without inject`）。
+ * 现在所有可选服务一律经 `services.js` 的 `optionalService()` 读取 —— 理由与实测见该文件。
+ *
  * ⚠️ 同理刻意**不注入 `timer`**：定时日报是可选特性，缺依赖时只告警不阻塞。
  */
 export const inject = ['tools'];
@@ -73,16 +79,19 @@ export function apply(ctx, config = {}) {
   // 两个理由：
   //   ① DSH 的凭据服务语义就是"每次操作重新解析"，这类改动无需重启插件即可生效；
   //   ② `apply()` 可能跑在 credentials 服务就绪**之前**（与定时器同一个容器顺序问题），
-  //      所以不能在 apply 时就把服务实例抓下来 —— 必须在调用时读 `ctx.credentials`。
+  //      所以不能在 apply 时就把服务实例抓下来 —— 必须在调用时读。
+  //
+  // ⚠️ 读法必须是 `resolveCredentials(ctx)`（= `ctx.get('credentials')`）而不是 `ctx.credentials`：
+  //    后者在"服务存在但本 fiber 未注入"时会**抛异常**（I6，见 services.js）。
   const credentials = {
     async resolve(ref) {
-      const svc = ctx.credentials;
+      const svc = resolveCredentials(ctx);
       if (!svc || !ref) return undefined;
       const resolved = await svc.resolve(ref);
       return resolved?.value;
     },
     async describe(ref) {
-      const svc = ctx.credentials;
+      const svc = resolveCredentials(ctx);
       if (!svc || !ref) return { configured: false, writable: false };
       return svc.describe(ref);
     },
@@ -231,8 +240,10 @@ export function apply(ctx, config = {}) {
   // 决策见文件头：approval 是可选注入，缺失时插件照常加载，但 R2/R3 会被 fail-closed 拒绝。
   // 既然选择了"不阻塞加载"，就有义务把"审批不可用"这件事说清楚 ——
   // 否则用户只会看到"特权动作执行不了"，猜不到原因。
-  const approvalAvailable = () => Boolean(ctx.approval && typeof ctx.approval.request === 'function');
-  if (!approvalAvailable()) {
+  //
+  // ⚠️ 读取必须走 `approvalAvailable(ctx)`（内部用 `ctx.get`）。写成 `ctx.approval` 会抛异常，
+  //    而**抛在这个位置等于整棵插件树加载失败** —— I5 落地时就是这么把 DSH 弄成起不来的。
+  if (!approvalAvailable(ctx)) {
     ctx.logger?.warn?.(
       'vmprobe: 审批服务（ctx.approval）不可用 —— 插件已加载，R0/R1 只读与可逆动作可用，'
       + 'R2/R3 特权动作将按 fail-closed 一律拒绝执行，直到审批服务就绪。',
@@ -251,18 +262,28 @@ export function apply(ctx, config = {}) {
 
   // ---- 基础用法提示（极简，进每轮请求前缀，必须克制）----
   // 完整用法走 vmprobe_catalog 按需拉取，避免常驻 token 开销。
+  //
+  // 同 I6：`ctx.systemPrompt` 也是一个"未注入即抛"的服务，所以经 optionalService 读。
+  //
+  // 签名已核实（不再猜）：`PromptSection = { name, order, text }`
+  //   —— dsh-system-prompt/lib/types/index.d.ts:47，且 `section()` 对非有限 `order` 直接
+  //      抛 TypeError（lib/index.js:186）。此前写的 `{ id, title, content }` 三个字段**全错**，
+  //      抛出的 TypeError 又被本段 try/catch 吞成一条"不可用"告警 —— 于是提示从未注入，
+  //      而日志看起来只像"宿主不支持"。这是同一类错误的第 N 次重演：**签名不核实 = 静默失效**。
+  //   —— order 约定：100–199 给工具指引（同文件 51-55 行的注释）。
   try {
-    if (ctx.systemPrompt && typeof ctx.systemPrompt.section === 'function') {
-      ctx.systemPrompt.section({
-        id: 'vmprobe',
-        title: 'VMProbe（虚拟机探针）',
-        content:
+    const systemPrompt = optionalService(ctx, 'systemPrompt');
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      systemPrompt.section({
+        name: 'vmprobe',
+        order: 150,
+        text:
           '本会话装配了 VMProbe，可经 SSH 管理 Linux 虚拟机。' +
           '执行任何变更前先用 vmprobe_catalog 确认可用动作；不要自行拼 shell 命令。' +
           '风险级由动作目录决定，R2/R3 会自动请求用户审批 —— 用户拒绝时如实转述，不要换动作绕过。',
       });
     } else {
-      // 不静默失败：签名未经核实，缺失时留下明确告警而不是假装成功
+      // 不静默失败：服务不可用时留下明确告警而不是假装成功
       ctx.logger?.warn?.(
         'vmprobe: ctx.systemPrompt.section 不可用，基础用法提示未注入（完整用法仍可经 vmprobe_catalog 获取）',
       );

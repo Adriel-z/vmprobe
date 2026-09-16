@@ -610,6 +610,11 @@ M5 的一部分（审计链 HMAC）。同时补上运行日志（技术债 #13�
 
 ### 13.1 I5：把"安全"从加载期挪到执行期（设计变更，不是缺陷）
 
+> ⚠️ **后续（第九轮，见 §15）**：本节的决定**方向正确、落地有缺陷** —— 只改了"要不要注入"，
+> 没改"怎么读"，于是 `apply()` 里那句 `ctx.approval &&` 当天就让 DSH 起不来了。
+> 结论仍然保留（`inject = ['tools']`），但现在所有可选服务一律经 `ctx.get` 读。
+> 本节说的"验证做成了最强的那种"也要打个折：它验的是**行为**，没验**宿主语义**。
+
 原方案 `inject = ['tools','approval']` 的理由是"没有审批器就无法安全执行 R2/R3" ——
 **理由没错，手段错了**：`inject` 里的服务未就绪时插件的 `apply()` 根本不会执行，
 于是"缺一个可选服务"会导致工具一个都没注册，甚至那条 loader entry 失败 →
@@ -722,19 +727,140 @@ PowerShell 把 `'""'` 当成**两个引号字符**传给了 ssh-keygen，于是�
 
 ---
 
-*报告结束。八轮合计：**可复现并修复的缺陷 48 项**
+## 15. 第九轮：I5 落地后**从未真正启动过** —— 一次真机崩溃的定位与修复
+
+**一句话**：I5 决策（把 `approval` 从必需注入里拿掉）在提交时**六项检查全绿**，
+但它当天就让 DSH 起不来了 —— 因为 `apply()` 里那句 `ctx.approval &&` 本身就会抛。
+
+### 15.1 现象与证据
+
+用户在自己终端跑 `dsh web` 得到：
+
+```
+Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include):
+  failed to apply loader entry vmprobe-host (@vmprobe/plugin-host):
+  cannot get property "approval" without inject
+    at approvalAvailable (packages/plugin-host/src/index.js:234:47)
+```
+
+三份可对上的证据（不是推测）：
+
+| 证据 | 内容 |
+|---|---|
+| 崩溃栈 | 落在 `index.js` 的 `approvalAvailable()` —— 即 `Boolean(ctx.approval && …)` 这一次**属性读取** |
+| 加载台账 | `loads.jsonl` 里 **2026-09-15 17:32（I5 提交 9b01ecd）之后的 4 次启动全部只有 `config.effective`**，之后就没有 `load` 了；而 09-15 那两次成功启动都在提交**之前** |
+| cordis 源码 | `@deepseek-ai/cordis/lib/index.js:675`：`new Error('cannot get property "${prop}" without inject')`，随后走 `internal/get` waterfall 沿 fiber 链上溯，**只在 `inject` 快照里找**（`Fiber.store` 的注释原话：*snapshot of **required** service implementations*） |
+
+### 15.2 根因（两类，都在同一次改动里）
+
+1. **读的口径错了**：`approval` 由 `dsh-base` 的 `dsh-user-approval`（entry id `approval`）提供，
+   与 VMProbe 是**兄弟 entry**。VMProbe 没注入它 → cordis 的 Proxy **抛异常**。
+   `ctx.optional?.foo()` 这种 JS 习惯在这里是硬失败，而不是 `undefined`。
+   DSH 自己的写法是 `ctx.get(name)`（`dsh-tools` 的 `serviceAsk`、`dsh-tool-bash/-fs/-pwsh`、
+   `dsh-subagent`、`dsh-host-apiproxy` 全都这么写；文档原话 "without the inject requirement"）。
+2. **同类第二处（未被发现，因为都在同一段 try/catch 里）**：`ctx.systemPrompt.section({ id, title, content })`
+   —— `PromptSection` 要的是 `{ name, order, text }`（`dsh-system-prompt/lib/types/index.d.ts:47`），
+   且 `order` 非有限数直接抛 `TypeError`。三个字段**全错**，异常被吞成一条"宿主不支持"的告警，
+   于是**基础用法提示从未注入过**，而日志看起来像环境问题。
+
+另外两处**同源但尚未引爆**：`ctx.credentials`（在 `index.js` 的 credentials 适配与
+`tools.js` 的 `credentialState` 里）—— 一旦真的去解析凭据引用，会抛同样的错。
+
+### 15.3 为什么六项检查一条都没拦住
+
+因为契约检查用的 ctx 是**裸对象**：读一个不存在的字段只会得到 `undefined` ——
+**正好把我当时的（错误）假设验证了一遍**。这正是 §5.2 坑 14 说的
+"别用自己写的桩去验证行为"，只不过这次验证的是**宿主语义**而不是产品行为。
+剩下的检查（单元测试、故障推演、SSH 端到端、归档、文档、协从端）都不经过 DSH 的插件加载路径。
+
+### 15.4 修复
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 1 | 新增 `services.js`：`optionalService(ctx, name)` / `resolveApproval` / `approvalAvailable` / `resolveCredentials`，一律走 `ctx.get`，**永不抛**；裸对象 ctx 走 `ctx[name]` 兜底（契约检查与单元测试继续可用） | `plugin-host/src/services.js` |
+| 2 | 所有可选服务读取改经该模块（approval ×4、credentials ×3、systemPrompt ×1） | `index.js` `tools.js` |
+| 3 | `systemPrompt.section` 按类型改为 `{ name:'vmprobe', order:150, text }` | `index.js` |
+| 4 | 台账/告警口径不变：审批可用性仍**显式可见**（`approval.available` / `approval.unavailable`），R2/R3 仍 fail-closed | — |
+
+**安全属性没有被削弱**：仍然"加载期永不阻塞、执行期严格 fail-closed"；
+I5 的意图（缺审批不让整棵树失败）现在**才真的成立**。
+
+### 15.5 新增的探测点（4 类）
+
+1. **模拟 cordis 代理**（裸对象 + 抛异常的 getter）：apply 不抛、工具全注册、
+   `ctx.get` 能拿到、`ctx.approval` **必须抛**（探测点自身的有效性）。
+2. **真实 cordis 最小插件树**：用 DSH 自带的 cordis 起三个**兄弟** fiber
+   （一个 provide `approval`、一个 provide `tools`、第三个是 VMProbe），断言加载成功、
+   台账 `approval.available`、`ctx.get('approval')` 能取到兄弟提供的服务、R3 的审批确实到达该服务。
+   —— 这是"用真宿主验证宿主语义"，不再依赖我的假设。
+3. **systemPrompt 注册参数形状**（name/order/text）—— 专治"签名猜错被 try/catch 吞掉"。
+4. `credentials` 不可用时**不抛**，而是如实说"凭据状态未知"（`known:false`）。
+
+### 15.6 诚实交代：这一轮的验证边界
+
+- **契约检查里的真实 cordis 不等于真机**：它验证"插件能在宿主语义下加载"，
+  但**不覆盖** Loader 组装、profile 组合、bundles 依赖解析 —— 那仍然只有
+  `dsh --profile web --no-open --port 0` 能验证（§5.2 坑 1）。
+- 本轮**没能**在我这边跑成真机启动：沙箱不允许 node 子进程写 `~/.dsh`
+  （`mkdir 'C:\Users\-.dsh\profiles\node_modules'` → `EPERM`，去 `NODE_OPTIONS` 后依旧）。
+  因此真机确认只能另找一次会话做（命令与判据见 §15.7；**✅ 已于 2026-09-16 11:57 在本机跑通，见 §15.8**）。
+- R2/R3 的**真实审批弹窗**（有人在对话里点"允许"）依然没有验证过 —— 现在只验证到
+  "审批请求真的发到了审批服务"，没验证到"用户点允许之后端到端执行成功"。
+
+### 15.7 真机确认清单（请跑一次）
+
+```powershell
+# 1) 另起临时实例（不动正在服务的那个）
+dsh --profile web --no-open --port 0
+# 2) 另开一个窗口看台账
+Get-Content "$env:USERPROFILE\.dsh\vmprobe\loads.jsonl" -Tail 6
+```
+
+判据（按顺序）：
+
+1. **不再出现** `plugin tree failed to load` / `cannot get property "approval" without inject`；
+2. 台账出现 `"event":"load"`，并且**在它之前**有一条 `"event":"approval.available"`
+   （若为 `approval.unavailable`，说明审批服务没组合进来 —— 也是如实记录，不是崩溃）；
+3. 会话里能列出 6 个 `vmprobe_*` 工具；
+4. 启动日志里**没有** `ctx.systemPrompt.section 不可用` 这条告警（说明提示真注入了）。
+
+### 15.8 真机确认结果（2026-09-16 11:57，**通过**）
+
+用**正常启动路径**跑通（不是临时实例）：计划任务 `DSH-Web-UI` → `%DSH_HOME%\dsh-web.ps1 -Hidden`
+→ `dsh web`（默认端口 3080）。
+
+| 判据 | 实测 |
+|---|---|
+| 1 无加载失败 | 11:57:45 那次启动日志**没有** `plugin tree failed to load`；对照：09-16 的 10:23:08 与 11:06:58 两次都在这条错误后 `dsh web exited with code 1` |
+| 2 台账顺序 | `…"event":"approval.available"`（pid 9524）→ `…"event":"load"`（6 个工具）→ `heartbeat.started` → `scheduler.started` |
+| 3 工具可见 | 会话里 6 个 `vmprobe_*` 工具全部可用；`vmprobe_status` 实调成功 |
+| 4 提示已注入 | 系统提示前缀里**逐字出现** `index.js` 的那段 vmprobe 文字 —— 说明 `systemPrompt.section({name,order,text})` 这次真的生效（旧签名 `{id,title,content}` 三个字段全错，从未注入过） |
+
+补充事实：`http://127.0.0.1:3080` 返回 HTTP 200；崩溃期间用户用 `--port 0` 起的备用实例（随机端口）
+同样能加载（台账 pid 10352），即故障范围就是"插件树加载"这一处，与端口、profile 组装无关。
+
+`web.log` 的坑（下次排查别踩）：该文件是**混合编码**（早期由 `Tee-Object` 写的 UTF-16LE 段 +
+后来 `-Hidden` 分支 `Out-File -Encoding utf8` 追加的 UTF-8 段）。ripgrep/`Select-String` 能正常读，
+但 `Get-Content -Raw -Encoding Unicode` 会把整段解成乱码，别据此判断"日志损坏"。
+
+---
+
+*报告结束。九轮合计：**可复现并修复的缺陷 50 项**
 （16 + 3 协从端 + 5 结构性 + 3 修复中发现 + 4 M1 实现中发现 + 3 心跳轮 + 5 M2 轮 + 2 取消轮
-+ 1 发布轮 + 1 测试台保真度 + 2 归档轮 + 3 发布脚本轮），
++ 1 发布轮 + 1 测试台保真度 + 2 归档轮 + 3 发布脚本轮 + **2 I6 轮**），
 另有 **8 项测试侧误判**、**2 项测试台缺陷**、**1 次编辑事故**与**1 次密钥生成操作事故**
 （§11.2 / §11.3 / §12.3 / §12.6 / §12.7 / §13.3 / §13.4 / §14.3）单独列出，不计入产品缺陷数。
-其中 **3 项只有真机启动才能发现**（定时器静默未启动、凭据文件致 DSH 无法启动、JSON schema 子集不兼容）、
+其中 **4 项只有真机启动才能发现**（定时器静默未启动、凭据文件致 DSH 无法启动、
+JSON schema 子集不兼容、**I5 落地当天的"可选服务不能直接读"**）、
 **1 项在写代码时被自己拦住**（`timeoutMs: null`）、**1 项由"绿测试"掩盖**（取消被报成成功）、
 **1 项只有真机发布才暴露**（令牌被写进仓库工作区）——
 这些都属于"一处出错就让整棵插件树加载不出来"或"看起来成功其实没做到"的致命形态，
-因此现在有**四道防线**：环境预检（`doctor`）、用宿主校验器做的契约检查、
-**外部实现交叉验证**（归档交给 PowerShell 解压），以及测试纪律
-（"没发生"类断言必须跨过"本该发生的时刻"；"被拒绝"要追到"什么都没做"）。
+因此现在有**五道防线**：环境预检（`doctor`）、用宿主校验器做的契约检查、
+**真实 cordis 的加载检查**、**外部实现交叉验证**（归档交给 PowerShell 解压），以及测试纪律
+（"没发生"类断言必须跨过"本该发生的时刻"；"被拒绝"要追到"什么都没做"；
+**桩不能用来验证宿主语义** —— 这条是本轮新加的）。
 另有 **1 项纯环境问题**（github.com:443 连接干扰，§14）—— 它不是代码缺陷，
 但已给出可复现的诊断工具与三条可用通道（SSH / HTTPS+代理 / REST API），并已实际打通。
-剩下的：M4（缺 Linux 目标）、客户端 UI（缺客户端打包链）、M5 其余项，
+剩下的：M4（缺 Linux 目标）、客户端 UI（缺客户端打包链）、M5 其余项、
+**真机启动确认（§15.7，需人在终端跑一次）**，
 以及两条已写明的 HMAC 诚实边界（整段重写需 `requireHmac` 才能发现；密钥与审计同目录时不保护"能读该目录的人"）。*

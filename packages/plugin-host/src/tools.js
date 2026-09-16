@@ -13,6 +13,7 @@
  */
 
 import { NotImplementedInM0Error } from './engine.js';
+import { approvalAvailable, resolveApproval, resolveCredentials } from './services.js';
 
 /** 连接状态 → 人话。不给"看起来像真状态"的假值（I9）。 */
 const CONN_LABEL = {
@@ -34,7 +35,8 @@ const text = (t) => [{ type: 'text', text: String(t) }];
 async function credentialState(ctx, ref) {
   if (!ref) return { configured: false, writable: false, known: false };
   try {
-    const svc = ctx?.credentials;
+    // 经 services.js 读：`ctx.credentials` 在"服务存在但未注入"时会抛异常（I6）
+    const svc = resolveCredentials(ctx);
     if (!svc || typeof svc.describe !== 'function') {
       return { configured: false, writable: false, known: false };
     }
@@ -109,7 +111,7 @@ export const USAGE_HINT = `## VMProbe 基础用法
 /**
  * 构造全部工具定义。
  * @param {object} engine createEngine 的返回值
- * @param {object} ctx DSH 的插件上下文（只用到 approval / jobs / logger）
+ * @param {object} ctx DSH 的插件上下文（只用到 approval / credentials / logger）
  * @returns {object[]} ToolDefinition[]
  */
 export function createTools(engine, ctx) {
@@ -428,13 +430,14 @@ export function createTools(engine, ctx) {
           audit: engine.verifyAudit(),
           warnings: [
             // I5：审批服务不可用属于"组合/配置"层面的问题，必须与其它配置警告一起出现在对话里 ——
-            // 否则用户只会看到"R2/R3 执行不了"，猜不到原因
-            ...(ctx?.approval && typeof ctx.approval.request === 'function'
+            // 否则用户只会看到"R2/R3 执行不了"，猜不到原因。
+            // （I6：判定经 services.js，绝不在工具执行路径上直接碰 `ctx.approval`）
+            ...(approvalAvailable(ctx)
               ? []
               : ['审批服务（ctx.approval）不可用：R0/R1 动作可用，R2/R3 一律拒绝执行（fail-closed）']),
             ...(engine.configWarnings ?? []),
           ],
-          approvalAvailable: Boolean(ctx?.approval && typeof ctx.approval.request === 'function'),
+          approvalAvailable: approvalAvailable(ctx),
         };
       },
     },
@@ -617,7 +620,11 @@ export function createTools(engine, ctx) {
         // ③ 审批（仅 R2/R3；R0/R1 已由策略判定免弹）
         let approval = { required: false, decision: 'not-required' };
         if (plan.requiresApproval) {
-          if (!ctx?.approval || typeof ctx.approval.request !== 'function') {
+          // I6：审批器经 services.js 取；取不到即 fail-closed，**不是**抛异常。
+          // （此前写成 `ctx?.approval` —— 在未注入的上下文里那会直接抛
+          //  "cannot get property approval without inject"，用户看到的将是一句无意义的报错。）
+          const approver = resolveApproval(ctx);
+          if (!approver || typeof approver.request !== 'function') {
             return {
               status: 'blocked', plan,
               error: '审批服务不可用，按 fail-closed 拒绝执行。',
@@ -631,7 +638,7 @@ export function createTools(engine, ctx) {
             };
           }
 
-          const decision = await ctx.approval.request({
+          const decision = await approver.request({
             agent: exec.agent,
             toolName: 'vmprobe_action',
             callId: exec.callId,

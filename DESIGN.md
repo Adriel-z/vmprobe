@@ -439,6 +439,16 @@ ssh <target>  "sh -s -- --check"   ← stdin = bootstrap.sh 的内容
 验证方式也刻意做成了最强的那种：契约检查里用**假传输层让计划新鲜度能过**（否则 R3 会停在
 `stale` 那一关、根本走不到审批护栏），然后断言 `apply` **一次都没被调用**。
 
+> ⚠️ **I6 补丁（第九轮真机验证）**：上面这条决策**方向对、落地错** —— 只决定"不注入"是不够的，
+> 还得决定"**怎么读**"。cordis 的 ctx 是 Proxy：读未注入的服务名**抛异常**
+> （`cannot get property "approval" without inject`），于是 `apply()` 里那句 `ctx.approval &&`
+> 自己就把整棵树带崩了，`dsh web` 当天起不来（`ISSUES.md` §15）。
+> 现在所有可选服务一律经 `packages/plugin-host/src/services.js` 的 `ctx.get(name)` 读取；
+> 本节表格里的行为描述**现在才真的成立**。契约检查也补了"真实 cordis 起兄弟 entry"的探测点。
+>
+> 附带教训（值得单独记）：I5 提交时**八层检查全绿** —— 因为契约检查用的 ctx 是裸对象，
+> 读不存在的字段只得到 `undefined`，正好把当时的错误假设"验证"了一遍。
+
 ### D15 —— 审计链加 HMAC：从"能检出改动"走到"伪造需要密钥"（M5）
 
 无密钥的 sha256 链有个诚实的局限：拥有写权限、且愿意重算整条链的攻击者可以伪造（**重算即自洽**）。
@@ -675,8 +685,10 @@ DSH 插件是 CORDIS 函数插件：导出 `name` / `inject` / `apply`，**且�
 // packages/plugin-host/src/index.js —— 以下形状已对着 DSH 类型声明核实并实测通过
 export const name = 'vmprobe'
 
-// 静态注入：缺失即组合错误（fail-fast），避免运行时空引用
-export const inject = ['tools', 'approval']
+// 静态注入：只放"缺了就什么也做不了"的服务（fail-fast）。
+// ⚠️ approval / credentials / systemPrompt / timer **不在这里** —— 可选服务缺失不该让整棵树失败（I5），
+//    读它们必须走 `ctx.get(name)`（I6，见下方"可选服务的读法"与 DEVELOPMENT §5.2 坑 18）
+export const inject = ['tools']
 
 // apply() 保持**同步**：CORDIS 是否 await 异步 apply 未经核实，因此不依赖它。
 // 目录加载与存储目录创建改用同步 API（文件极小），工具执行仍全部异步。
@@ -712,10 +724,13 @@ export function apply(ctx, config = {}) {
 
       // ③ 审批（仅 R2/R3；R0/R1 已由策略判定免弹）
       if (plan.requiresApproval) {
-        if (!ctx.approval || !exec.agent) {
+        // ★ 必须用 ctx.get —— 直接写 `ctx.approval` 在"服务存在但本 fiber 未注入"时会**抛异常**，
+        //   而工具路径上的未捕获异常 = 用户看到一句无意义的报错（I6）
+        const approval = ctx.get('approval')
+        if (!approval || !exec.agent) {
           return { status: 'blocked', plan, error: '按 fail-closed 拒绝执行' }
         }
-        const decision = await ctx.approval.request({
+        const decision = await approval.request({
           agent: exec.agent,                 // 必填：决定审计事件写进哪个 session
           toolName: 'vmprobe_action',
           callId: exec.callId,               // 可选：把审批提示挂到已流式展示的调用上
@@ -746,8 +761,9 @@ export function apply(ctx, config = {}) {
 
 | 文件 | 内容 |
 |---|---|
-| `packages/plugin-host/src/index.js` | `name` / `inject` / `apply`，同步 apply，注册 5 个工具 |
-| `packages/plugin-host/src/tools.js` | 5 个 `ToolDefinition`（含必填 `output`、`presentCall`） |
+| `packages/plugin-host/src/index.js` | `name` / `inject` / `apply`，同步 apply，注册 6 个工具 |
+| `packages/plugin-host/src/services.js` | **可选服务的唯一读取入口**（`ctx.get`，I6） |
+| `packages/plugin-host/src/tools.js` | 6 个 `ToolDefinition`（含必填 `output`、`presentCall`） |
 | `packages/plugin-host/src/engine.js` | 引擎：目标/目录/计划/审计，**零 DSH 依赖** |
 
 **挂载方式**（✅ **已真机验证** — 见 `ISSUES.md` §9.2）
@@ -804,8 +820,15 @@ export function apply(ctx, config = {}) {
 
 | 依赖性质 | 声明方式 | 缺失时 |
 |---|---|---|
-| **核心必需**（`tools` / `approval`） | 顶层 `export const inject = [...]` | 插件加载失败（fail-fast，正确） |
+| **核心必需**（`tools`） | 顶层 `export const inject = [...]` | 插件加载失败（fail-fast，正确） |
+| **可选服务**（`approval` / `credentials` / `systemPrompt`） | **不注入**，用 `ctx.get(name)` 读 | 得到 `undefined` → 降级（审批缺失即 R2/R3 fail-closed）+ 明确告警 + 落台账 |
 | **可选特性**（`timer`） | `ctx.inject([...], cb)` | 回调不执行，插件照常加载 + 明确告警 + 落台账 |
+
+> ⚠️ **可选服务的读法（I6，第九轮真机验证）**：`inject` 只决定"要不要把服务快照进 fiber"，
+> 而 **Proxy 会拒绝读取任何未注入的服务名** —— `ctx.approval` 抛
+> `cannot get property "approval" without inject`，不是返回 `undefined`。
+> `apply()` 里抛错 = 那条 loader entry 失败 = **整棵树加载不出来**（I5 落地当天真的发生了）。
+> DSH 自己的做法是 `ctx.get(name)`；本项目收敛在 `packages/plugin-host/src/services.js`。
 
 同时还暴露了一个更基础的问题：**`ctx.logger` 的输出既不一定进 stdout、也不一定进 DSH 日志文件**，
 于是"插件到底加载了没有 / 定时器起来没有"靠看日志答不上来。因此引入**加载台账**
